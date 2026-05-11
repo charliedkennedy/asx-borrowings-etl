@@ -41,9 +41,3 @@ python src/main.py --input tickers.csv --skip-source-discovery --source-register
 - `extraction unclear, manual review required`
 
 Use manual review flag and exceptions report for verification.
-
-## Run from GitHub Actions
-1. Go to **Actions** in the GitHub repository.
-2. Select **Run Borrowings ETL**.
-3. Click **Run workflow**.
-4. When the run completes, download the **borrowings-etl-outputs** artifact.
