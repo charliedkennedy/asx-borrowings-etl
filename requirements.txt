@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+pymupdf
+pandas
+openpyxl
+pytest
