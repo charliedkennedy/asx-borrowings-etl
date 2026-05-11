@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+outputs/*.csv
+outputs/*.xlsx
+outputs/snippets/*
+outputs/logs/*
+pdf_cache/*
+!outputs/.gitkeep
+!outputs/snippets/.gitkeep
+!outputs/logs/.gitkeep
+!pdf_cache/.gitkeep
+*.tmp
+.DS_Store
