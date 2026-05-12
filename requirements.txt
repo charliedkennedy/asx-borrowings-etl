@@ -1,6 +1,8 @@
 requests
 beautifulsoup4
 pymupdf
+pypdf
+pdfplumber
 pandas
 openpyxl
 pytest
