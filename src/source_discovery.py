@@ -36,8 +36,9 @@ LOW_VALUE_KEYWORDS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; asx-borrowings-etl/1.0; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
 }
 
 
@@ -55,7 +56,6 @@ def _asx_code(ticker: str) -> str:
 
 
 def _decode_search_href(href: str) -> str:
-    """Decode DuckDuckGo redirect links into the real target URL."""
     if not href:
         return ""
     if href.startswith("//"):
@@ -73,8 +73,6 @@ def _is_official(url: str) -> bool:
         return False
     if "asx.com.au" in u or "announcements.asx.com.au" in u:
         return True
-    # Company investor-centre PDFs/pages are usually on the issuer's own domain.
-    # Exclude obvious third-party market data / news aggregators.
     blocked = [
         "marketindex.com.au",
         "investsmart.com.au",
@@ -84,12 +82,22 @@ def _is_official(url: str) -> bool:
         "afr.com",
         "themarketonline",
     ]
-    return not any(b in u for b in blocked) and ".com" in urlparse(u).netloc
+    host = urlparse(u).netloc
+    return not any(b in u for b in blocked) and "." in host
+
+
+def _is_asx_display_url(url: str) -> bool:
+    return "displayannouncement.do" in (url or "").lower()
+
+
+def _is_direct_pdf_url(url: str) -> bool:
+    u = (url or "").lower()
+    return u.endswith(".pdf") or "/asxpdf/" in u or "announcements.asx.com.au/asxpdf" in u
 
 
 def _looks_like_pdf_or_announcement(url: str) -> bool:
     u = (url or "").lower()
-    return u.endswith(".pdf") or "/asxpdf/" in u or "displayannouncement" in u or "announcements.asx.com.au" in u
+    return _is_direct_pdf_url(u) or _is_asx_display_url(u)
 
 
 def _looks_report(text: str, url: str = "") -> bool:
@@ -103,7 +111,6 @@ def _looks_report(text: str, url: str = "") -> bool:
 
 def _extract_report_date(title: str, url: str = "") -> str:
     combined = f"{title or ''} {url or ''}"
-    # Prefer explicit day/month/year dates where available.
     patterns = [
         r"(\d{1,2})[\-/\.](\d{1,2})[\-/\.](20\d{2})",
         r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+(20\d{2})",
@@ -117,12 +124,12 @@ def _extract_report_date(title: str, url: str = "") -> str:
         if m.group(2).isdigit():
             day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
         else:
-            day, month, year = int(m.group(1)), month_lookup[m.group(2).lower()[:4] if m.group(2).lower().startswith("sept") else m.group(2).lower()[:3]], int(m.group(3))
+            key = m.group(2).lower()[:4] if m.group(2).lower().startswith("sept") else m.group(2).lower()[:3]
+            day, month, year = int(m.group(1)), month_lookup[key], int(m.group(3))
         try:
             return datetime(year, month, day).date().isoformat()
         except ValueError:
             pass
-    # Otherwise capture financial/reporting year only as reporting_period, not report date.
     return ""
 
 
@@ -135,10 +142,15 @@ def _extract_reporting_period(title: str, url: str = "") -> str:
 def _candidate_score(candidate: Candidate) -> int:
     text = f"{candidate.title} {candidate.url}".lower()
     score = 0
-    if "asx.com.au" in text or "announcements.asx.com.au" in text:
-        score += 100
-    if _looks_like_pdf_or_announcement(candidate.url):
-        score += 60
+    if _is_direct_pdf_url(candidate.url):
+        score += 120
+    if "announcements.asx.com.au/asxpdf" in text:
+        score += 80
+    elif "asx.com.au" in text:
+        score += 45
+    if _is_asx_display_url(candidate.url):
+        # These are official but can be awkward to download in Actions; prefer direct PDFs/company PDFs when found.
+        score -= 20
     keyword_scores = {
         "appendix 4e": 45,
         "appendix 4d": 45,
@@ -195,8 +207,7 @@ def _parse_links_from_page(page_url: str, html: str) -> Iterable[Tuple[str, str]
 def _search_asx_historical(code: str, timeout: int) -> List[Candidate]:
     candidates: List[Candidate] = []
     current_year = datetime.utcnow().year
-    years = [current_year, current_year - 1, current_year - 2]
-    for year in years:
+    for year in [current_year, current_year - 1, current_year - 2]:
         page = f"https://www.asx.com.au/asx/v2/statistics/announcements.do?by=asxCode&asxCode={quote(code)}&timeframe=Y&year={year}"
         html = _get_html(page, timeout)
         if not html:
@@ -209,11 +220,10 @@ def _search_asx_historical(code: str, timeout: int) -> List[Candidate]:
 
 def _search_asx_public_page(code: str, timeout: int) -> List[Candidate]:
     candidates: List[Candidate] = []
-    pages = [
+    for page in [
         f"https://www.asx.com.au/markets/trade-our-cash-market/announcements.{code.lower()}",
         f"https://www.asx.com.au/markets/trade-our-cash-market/announcements.{code.lower()}/",
-    ]
-    for page in pages:
+    ]:
         html = _get_html(page, timeout)
         if not html:
             continue
@@ -226,12 +236,13 @@ def _search_duckduckgo(ticker: str, company_name: str, timeout: int) -> List[Can
     candidates: List[Candidate] = []
     code = _asx_code(ticker)
     queries = [
+        f'"{company_name}" "annual report" filetype:pdf',
+        f'"{company_name}" "financial report" filetype:pdf',
+        f'"{company_name}" "Appendix 4E" filetype:pdf',
+        f'"{company_name}" "Appendix 4D" filetype:pdf',
         f'site:announcements.asx.com.au/asxpdf {code} "annual report"',
         f'site:announcements.asx.com.au/asxpdf {code} "Appendix 4E"',
         f'site:announcements.asx.com.au/asxpdf {code} "Appendix 4D"',
-        f'site:asx.com.au/asxpdf {code} "financial report"',
-        f'"{company_name}" "annual report" pdf investor',
-        f'"{company_name}" "half year" "financial report" pdf',
     ]
     for q in queries:
         url = f"https://duckduckgo.com/html/?q={quote(q)}"
@@ -246,7 +257,6 @@ def _search_duckduckgo(ticker: str, company_name: str, timeout: int) -> List[Can
             if _looks_like_pdf_or_announcement(href):
                 _add_candidate(candidates, title, href, "ASX announcement" if "asx.com.au" in href.lower() else "company investor centre", url)
             elif _is_official(href):
-                # Open official investor page and pick report PDFs from it.
                 page_html = _get_html(href, timeout)
                 if not page_html:
                     continue
@@ -261,20 +271,18 @@ def discover_source(ticker: str, company_name: str, timeout: int = 20) -> Source
     rec = SourceRecord(ticker=ticker, company_name=company_name, source_status="source not located")
 
     candidates: List[Candidate] = []
-    discovery_steps = [
-        lambda: _search_asx_historical(code, timeout),
-        lambda: _search_asx_public_page(code, timeout),
-        lambda: _search_duckduckgo(ticker, company_name, timeout),
-    ]
-
     errors: List[str] = []
-    for step in discovery_steps:
+    # Run company/web search before ASX historical so direct company PDFs can outrank awkward ASX display URLs.
+    for step in [
+        lambda: _search_duckduckgo(ticker, company_name, timeout),
+        lambda: _search_asx_public_page(code, timeout),
+        lambda: _search_asx_historical(code, timeout),
+    ]:
         try:
             candidates.extend(step())
-        except Exception as exc:  # keep processing other methods
+        except Exception as exc:
             errors.append(str(exc))
 
-    # Deduplicate by URL and rank.
     unique = {}
     for c in candidates:
         if c.url not in unique or c.score > unique[c.url].score:
@@ -290,7 +298,7 @@ def discover_source(ticker: str, company_name: str, timeout: int = 20) -> Source
         rec.source_type = best.source_type
         rec.source_url = best.url
         rec.source_confidence = "high" if best.score >= 170 else "medium"
-        rec.notes = f"Discovered automatically. Score={best.score}. Source page={best.source_page}".strip()
+        rec.notes = f"Discovered automatically. Score={best.score}. Source page={best.source_page}"
         return rec
 
     rec.source_confidence = "low"
