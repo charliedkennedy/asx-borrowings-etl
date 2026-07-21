@@ -1,4 +1,4 @@
-name: Run Borrowings ETL
+name: Run ASX Maturity Screen Pilot
 
 on:
   workflow_dispatch:
@@ -21,13 +21,22 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run ETL
+        env:
+          # The repository secret is deliberately exposed only to this process.
+          # GitHub normalises secret names to uppercase. The expression accepts
+          # either the requested CHUCKKEY secret or the conventional name.
+          OPENAI_API_KEY: ${{ secrets.CHUCKKEY || secrets.OPENAI_API_KEY }}
         run: |
-          python src/main.py --input tickers.csv --output outputs --pdf-cache pdf_cache
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::Missing Actions secret. Add repository secret CHUCKKEY (or OPENAI_API_KEY), then rerun."
+            exit 2
+          fi
+          python src/asx_maturity_screen.py --pilot --input universe.csv --workdir . --output outputs/asx_maturity_screen.xlsx
 
       - name: Upload outputs artifact
         uses: actions/upload-artifact@v4
         with:
-          name: borrowings-etl-outputs
+          name: asx-maturity-screen-pilot
           path: outputs/
           if-no-files-found: error
 
@@ -36,7 +45,7 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          files=(pdf_cache/*.pdf pdf_cache/*.PDF)
+          files=(pdfs/*.pdf pdfs/*.PDF)
           if [ ${#files[@]} -gt 0 ]; then
             echo "has_pdfs=true" >> "$GITHUB_OUTPUT"
           else
@@ -47,6 +56,6 @@ jobs:
         if: steps.pdf_check.outputs.has_pdfs == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: borrowings-etl-pdf-cache
-          path: pdf_cache/
+          name: asx-maturity-screen-pilot-pdfs
+          path: pdfs/
           if-no-files-found: error
