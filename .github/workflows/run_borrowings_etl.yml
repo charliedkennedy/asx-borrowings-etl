@@ -23,14 +23,9 @@ jobs:
       - name: Run ETL
         env:
           # The repository secret is deliberately exposed only to this process.
-          # GitHub normalises secret names to uppercase. The expression accepts
-          # either the requested CHUCKKEY secret or the conventional name.
-          OPENAI_API_KEY: ${{ secrets.CHUCKKEY || secrets.OPENAI_API_KEY }}
+          # The application reads OPENAI_API_KEY; ChuckKey is the requested secret name.
+          OPENAI_API_KEY: ${{ secrets.ChuckKey }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::Missing Actions secret. Add repository secret CHUCKKEY (or OPENAI_API_KEY), then rerun."
-            exit 2
-          fi
           python src/asx_maturity_screen.py --pilot --input universe.csv --workdir . --output outputs/asx_maturity_screen.xlsx
 
       - name: Upload outputs artifact

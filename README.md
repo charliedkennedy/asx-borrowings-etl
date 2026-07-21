@@ -15,7 +15,6 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 # `ChuckKey` is also accepted and is mapped only in the process at runtime.
-# For GitHub Actions, save it as the repository secret `CHUCKKEY`.
 export OPENAI_API_KEY='...'
 python src/asx_maturity_screen.py --pilot --input universe.csv --output outputs/asx_maturity_screen.xlsx
 # after approval:
