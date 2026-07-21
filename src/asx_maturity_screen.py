@@ -9,8 +9,13 @@ import os
 import sys
 # Check this before optional runtime dependencies are imported so an unconfigured
 # machine gets the promised actionable message rather than an import traceback.
-if __name__ == "__main__" and not os.getenv("OPENAI_API_KEY"):
-    print("OPENAI_API_KEY is required; set it in the environment and rerun. No requests were made.", file=sys.stderr)
+def api_key_present() -> bool:
+    """Accept the requested ChuckKey alias without persisting a credential."""
+    return bool(os.getenv("OPENAI_API_KEY") or os.getenv("ChuckKey"))
+
+
+if __name__ == "__main__" and not api_key_present():
+    print("OPENAI_API_KEY (or ChuckKey) is required; set it in the environment and rerun. No requests were made.", file=sys.stderr)
     raise SystemExit(2)
 
 import argparse
@@ -271,8 +276,12 @@ def write_workbook(path: Path, rows: list[dict], facilities: list[dict], buckets
 
 def main() -> int:
     args = arg_parser().parse_args()
+    # The OpenAI SDK reads OPENAI_API_KEY.  Map the user-requested alias only in
+    # this process; it is never logged or written to disk.
+    if not api_key_present():
+        print("OPENAI_API_KEY (or ChuckKey) is required; set it in the environment and rerun. No requests were made.", file=sys.stderr); return 2
     if not os.getenv("OPENAI_API_KEY"):
-        print("OPENAI_API_KEY is required; set it in the environment and rerun. No requests were made.", file=sys.stderr); return 2
+        os.environ["OPENAI_API_KEY"] = os.environ["ChuckKey"]
     if args.pilot == args.remainder:
         print("Choose exactly one of --pilot or --remainder.", file=sys.stderr); return 2
     root = Path(args.workdir); tickers = read_tickers(Path(args.input)); tickers = [t for t in tickers if (t in PILOT) == args.pilot]

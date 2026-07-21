@@ -14,6 +14,7 @@ Only run the remainder after the pilot is reviewed and approved.
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# `ChuckKey` is also accepted and is mapped only in the process at runtime.
 export OPENAI_API_KEY='...'
 python src/asx_maturity_screen.py --pilot --input universe.csv --output outputs/asx_maturity_screen.xlsx
 # after approval:
