@@ -63,3 +63,20 @@ python src/main.py --input tickers.csv --skip-source-discovery --source-register
 - `extraction unclear, manual review required`
 
 Use manual review flag and exceptions report for verification.
+
+## Local Windows PDF workflow
+
+The default local mode never contacts ASX. It indexes financial-statement PDFs under the supplied directory, writes `outputs\\pdf_index.csv`, ranks candidates, and writes `outputs\\document_match_candidates.csv` and `outputs\\document_register.csv`.
+
+```powershell
+python src\asx_maturity_screen.py --pilot --match-only --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output outputs\asx_maturity_screen.xlsx
+```
+
+For extraction after reviewing the register, set the credential without echoing it and run the pilot:
+
+```powershell
+$secureKey = Read-Host "OpenAI API key" -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $secureKey).Password
+python src\asx_maturity_screen.py --pilot --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output outputs\asx_maturity_screen.xlsx
+Remove-Item Env:OPENAI_API_KEY
+```

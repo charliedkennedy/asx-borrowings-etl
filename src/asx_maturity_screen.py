@@ -38,6 +38,7 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from pydantic import BaseModel, Field
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from local_pdf_index import build_index, match_targets, read_targets
 
 ASX = "https://www.asx.com.au"
 USER_AGENT = "asx-maturity-screen/1.0 (statutory debt research; contact: debt-advisory@example.invalid)"
@@ -100,6 +101,10 @@ class Extraction(BaseModel):
 def arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", default="universe.csv")
+    p.add_argument("--targets", default="targets.csv")
+    p.add_argument("--pdf-root")
+    p.add_argument("--match-only", action="store_true")
+    p.add_argument("--allow-web-fallback", action="store_true")
     p.add_argument("--output", default="outputs/asx_maturity_screen.xlsx")
     p.add_argument("--workdir", default=".")
     p.add_argument("--pilot", action="store_true", help="Run the mandatory ten-name pilot.")
@@ -304,6 +309,19 @@ def write_workbook(path: Path, rows: list[dict], facilities: list[dict], buckets
 
 def main() -> int:
     args = arg_parser().parse_args()
+    if args.pdf_root:
+        import csv
+        output_dir = Path(args.output).parent
+        indexed = build_index(Path(args.pdf_root), output_dir / "pdf_index.csv")
+        targets = read_targets(Path(args.targets))
+        if args.pilot: targets = [t for t in targets if t["ticker"] in PILOT]
+        candidates, register = match_targets(targets, indexed)
+        for filename, rows in (("document_match_candidates.csv", candidates), ("document_register.csv", register)):
+            path=output_dir / filename; path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer=csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["ticker"]); writer.writeheader(); writer.writerows(rows)
+        if args.match_only:
+            print(f"Local matching complete: {output_dir / 'document_register.csv'}"); return 0
     # The OpenAI SDK reads OPENAI_API_KEY.  Map the user-requested alias only in
     # this process; it is never logged or written to disk.
     if not api_key_present():
