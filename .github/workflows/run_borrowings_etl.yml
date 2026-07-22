@@ -20,15 +20,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run tests
+        run: pytest -q
+
       - name: Run ETL
         env:
           # The repository secret is deliberately exposed only to this process.
-          # The application reads OPENAI_API_KEY; ChuckKey is the requested secret name.
-          OPENAI_API_KEY: ${{ secrets.ChuckKey }}
+          # GitHub normalises secret names to uppercase. The expression accepts
+          # either the requested CHUCKKEY secret or the conventional name.
+          OPENAI_API_KEY: ${{ secrets.CHUCKKEY || secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::Missing Actions secret. Add repository secret CHUCKKEY (or OPENAI_API_KEY), then rerun."
+            exit 2
+          fi
           python src/asx_maturity_screen.py --pilot --input universe.csv --workdir . --output outputs/asx_maturity_screen.xlsx
 
       - name: Upload outputs artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: asx-maturity-screen-pilot
@@ -48,9 +57,31 @@ jobs:
           fi
 
       - name: Upload PDF cache artifact
-        if: steps.pdf_check.outputs.has_pdfs == 'true'
+        if: always() && steps.pdf_check.outputs.has_pdfs == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: asx-maturity-screen-pilot-pdfs
           path: pdfs/
           if-no-files-found: error
+
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asx-maturity-screen-pilot-evidence
+          path: |
+            results.jsonl
+            page_images/
+            pdfs/
+            outputs/
+          if-no-files-found: warn
+
+      - name: Write retrieval errors to job summary
+        if: always()
+        run: |
+          echo '## ASX retrieval results' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f results.jsonl ]; then
+            python -c "import json; [print(f\"- {x['ticker']}: {x['status']} — {x.get('notes', '')}\") for x in map(json.loads, open('results.jsonl'))]" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- No result file was produced; see the IDX smoke-test error above.' >> "$GITHUB_STEP_SUMMARY"
+          fi

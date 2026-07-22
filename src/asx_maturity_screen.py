@@ -115,6 +115,10 @@ def read_tickers(path: Path) -> list[str]:
 def parse_date(value: str | None) -> date | None:
     if not value:
         return None
+    try:
+        return datetime.fromisoformat(re.sub(r"([+-]\\d{2})(\\d{2})$", r"\\1:\\2", str(value).replace("Z", "+00:00"))).date()
+    except ValueError:
+        pass
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d %B %Y", "%d %b %Y"):
         try: return datetime.strptime(value[:10] if fmt == "%Y-%m-%d" else value, fmt).date()
         except ValueError: pass
@@ -137,42 +141,66 @@ class AsxClient:
         response.raise_for_status()
         return response
 
-    def announcements(self, ticker: str) -> tuple[str, list[dict]]:
-        url = f"{ASX}/asx/1/company/{ticker}/announcements?count=50&market_sensitive=false"
-        data = self.get(url).json()
-        return (data.get("name") or data.get("company_name") or "", data.get("data") or data.get("announcements") or [])
+    def announcements(self, ticker: str, diagnostic: bool = False) -> tuple[str, list[dict]]:
+        url = f"{ASX}/asx/1/company/{ticker}/announcements?count=100&market_sensitive=false"
+        response = self.get(url)
+        try: data = response.json()
+        except ValueError as exc: raise RuntimeError(f"JSON_DECODE: {exc}; content-type={response.headers.get('content-type')}") from exc
+        items = announcement_items(data)
+        if diagnostic:
+            print(f"IDX ASX diagnostic: status={response.status_code} content_type={response.headers.get('content-type','')} keys={sorted(data) if isinstance(data,dict) else []} announcements={len(items)} first_keys={sorted(items[0]) if items else []}")
+        return (data.get("name") or data.get("company_name") or data.get("company", {}).get("name", ""), items)
 
 
-ANNUAL = ("annual report", "appendix 4e", "preliminary final report", "full year statutory accounts", "annual financial report")
-INTERIM = ("appendix 4d", "half year report", "half yearly report", "interim financial report")
+def announcement_items(data: object) -> list[dict]:
+    if isinstance(data, list): return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict): return []
+    for key in ("data", "announcements", "items", "results"):
+        v = data.get(key)
+        if isinstance(v, list): return [x for x in v if isinstance(x, dict)]
+        if isinstance(v, dict):
+            found = announcement_items(v)
+            if found: return found
+    return []
+
+
+ANNUAL = ("annual report", "annual financial report", "appendix 4e", "preliminary final report", "full year statutory accounts", "full year financial report", "full year results and appendix 4e", "financial report")
+INTERIM = ("appendix 4d", "half year report", "half-year report", "half yearly report", "interim financial report", "half-year financial report", "half year results and appendix 4d")
+EXCLUDED = ("presentation", "transcript", "sustainability", "notice of meeting", "corporate governance", "media release")
 
 
 def find_document(api: AsxClient, ticker: str, kind: str, root: Path) -> tuple[dict | None, str]:
+    errors = []
     try: company, items = api.announcements(ticker)
-    except Exception as exc: return None, str(exc)
+    except Exception as exc: company, items = "", []; errors.append(f"JSON_ENDPOINT_{type(exc).__name__}: {exc}")
     phrases, months = (ANNUAL, 15) if kind == "annual" else (INTERIM, 9)
     cutoff = date.today().replace(day=1)
     candidates = []
     for a in items:
         title = str(a.get("header") or a.get("title") or "")
-        released = str(a.get("date") or a.get("release_date") or a.get("document_date") or "")
+        released = str(a.get("document_release_date") or a.get("release_date") or a.get("document_date") or a.get("date") or "")
         d = parse_date(released)
-        if not d or (date.today() - d).days > months * 31 or not any(x in title.lower() for x in phrases): continue
+        low = title.lower()
+        if not d or (date.today() - d).days > months * 31 or not any(x in low for x in phrases) or any(x in low for x in EXCLUDED): continue
         url = a.get("url") or a.get("pdf_url") or a.get("document_url") or ""
         if url.startswith("/"): url = ASX + url
-        if url: candidates.append({"title": title, "date": d.isoformat(), "url": url, "company": company})
-    if not candidates: return None, "no matching announcement"
+        if url: candidates.append({"title": title, "date": d.isoformat(), "url": url, "company": company, "pages": int(a.get("number_of_pages") or 0)})
+    if not candidates: return None, "; ".join(errors + ["NO_MATCHING_ANNOUNCEMENT"])
     # Latest wins; PDFs are subsequently sized and a full report is favoured.
-    candidates.sort(key=lambda x: x["date"], reverse=True)
+    candidates.sort(key=lambda x: (x["pages"] >= 80, x["pages"], x["date"]), reverse=True)
     for c in candidates:
         try:
             response = api.get(c["url"])
-            if not response.content.startswith(b"%PDF"): continue
+            content_type = response.headers.get("content-type", "").lower()
+            if not response.content.startswith(b"%PDF") or (content_type and "pdf" not in content_type):
+                errors.append(f"PDF_INVALID status={response.status_code} content_type={content_type} signature={response.content[:4]!r}"); continue
+            try: fitz.open(stream=response.content, filetype="pdf").close()
+            except Exception as exc: errors.append(f"PDF_OPEN_{type(exc).__name__}: {exc}"); continue
             suffix = f"{ticker}_{kind}_{c['date']}.pdf"
             pdf = root / "pdfs" / suffix; pdf.parent.mkdir(parents=True, exist_ok=True); pdf.write_bytes(response.content)
             c["path"] = str(pdf); return c, ""
-        except Exception: continue
-    return None, "matching announcements had no downloadable PDF"
+        except Exception as exc: errors.append(f"DOWNLOAD_{type(exc).__name__}: {exc}")
+    return None, "; ".join(errors + ["NO_VALID_PDF"])
 
 
 KEYWORDS = ("borrowings", "interest-bearing", "financing arrangements", "financing facilities", "debt facilities", "loans and borrowings", "financial risk management", "liquidity risk", "maturity", "lease liabilities", "net debt")
@@ -286,7 +314,16 @@ def main() -> int:
         print("Choose exactly one of --pilot or --remainder.", file=sys.stderr); return 2
     root = Path(args.workdir); tickers = read_tickers(Path(args.input)); tickers = [t for t in tickers if (t in PILOT) == args.pilot]
     results_file = root / "results.jsonl"; completed = {json.loads(line)["ticker"] for line in results_file.read_text().splitlines()} if results_file.exists() else set()
-    api, oai = AsxClient(), OpenAI(); available = {m.id for m in oai.models.list().data}
+    api, oai = AsxClient(), OpenAI()
+    if args.pilot:
+        try:
+            api.announcements("IDX", diagnostic=True)
+            smoke, error = find_document(api, "IDX", "annual", root)
+            if not smoke: raise RuntimeError(error)
+            print(f"IDX retrieval smoke test passed: {smoke['path']}")
+        except Exception as exc:
+            print(f"IDX retrieval smoke test failed: {type(exc).__name__}: {exc}", file=sys.stderr); return 2
+    available = {m.id for m in oai.models.list().data}
     luna = "gpt-5.6-luna" if "gpt-5.6-luna" in available else None
     terra = "gpt-5.6-terra" if "gpt-5.6-terra" in available else None
     if not luna or not terra: print("Required Luna/Terra model IDs are unavailable on this API account.", file=sys.stderr); return 2
@@ -327,6 +364,8 @@ def main() -> int:
     write_workbook(Path(args.output),rows,facilities,buckets,log)
     print("Counts:",dict(Counter(x['status'] for x in log))); print(f"Total spend: ${total:.4f}"); print(f"Workbook: {args.output}")
     if args.pilot: print("PILOT COMPLETE — paused for approval before --remainder.")
+    if args.pilot and sum(x["status"] == "DOC_NOT_FOUND" for x in log) > 5:
+        print("Pilot failed: more than five tickers were DOC_NOT_FOUND.", file=sys.stderr); return 2
     return 0
 
 if __name__ == "__main__": raise SystemExit(main())
