@@ -61,5 +61,8 @@ def run_local(args):
   rows.append({'ticker':r['ticker'],'target name':r['target_name'],'match status':r['match_status'],'match confidence':r['match_confidence'],'status':status,'selected PDF':r['selected_pdf'],'match warning':r['validation_warning'],'extraction notes':'Local PDF selected; extraction pending.' if status=='PENDING_EXTRACTION' else r['match_reason']})
  (out/'results.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8'); workbook(Path(args.output),rows,register); print(f'Workbook: {args.output}'); return 0
 
-def main(): return run_local(parser().parse_args())
+def main_for_args(argv=None):
+ return run_local(parser().parse_args(argv))
+
+def main(): return main_for_args()
 if __name__=='__main__': raise SystemExit(main())
