@@ -14,3 +14,10 @@ pdf_cache/*
 !pdf_cache/.gitkeep
 *.tmp
 .DS_Store
+pdfs/
+page_images/
+outputs/
+results.jsonl
+*.xlsx
+pdf_index.csv
+pdf_index.json
