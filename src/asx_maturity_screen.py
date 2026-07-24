@@ -3,11 +3,27 @@ from __future__ import annotations
 import argparse, csv, json, os, sys
 from pathlib import Path
 from openpyxl import Workbook
+from openpyxl.comments import Comment
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from .local_pdf_index import build_index, match_targets, read_targets
 
 PILOT=("IDX","MTS","EVT","XRO","BSL","CHC","DMP","GNC","S32","TAH")
 ACCEPTED={"MATCHED_HIGH","MATCHED_MEDIUM"}
+HALVES=("2H26","1H27","2H27","1H28","2H28","FY29+")
+
+def calendar_half(value):
+ if not value:return None
+ year,month=int(str(value)[:4]),int(str(value)[5:7]); key=f"{'1H' if month<=6 else '2H'}{str(year)[-2:]}"
+ return key if key in HALVES else 'FY29+'
+def allocate_exact(amount, maturity_date):
+ key=calendar_half(maturity_date); return {k:(amount if k==key else None) for k in HALVES}
+def allocate_bucket(amount,start_month,end_month,balance_year=2026,balance_month=6):
+ out={k:None for k in HALVES}
+ if amount is None or start_month is None or end_month is None or end_month<=start_month:return out
+ for n in range(start_month,end_month):
+  y=balance_year+(balance_month-1+n)//12; m=(balance_month-1+n)%12+1; key=calendar_half(f'{y}-{m:02}-01'); out[key]=(out[key] or 0)+amount/(end_month-start_month)
+ return out
 
 def parser():
  p=argparse.ArgumentParser(description=__doc__); p.add_argument('--pdf-root',required=True); p.add_argument('--targets',required=True); p.add_argument('--output',default='outputs/asx_maturity_screen.xlsx'); p.add_argument('--pilot',action='store_true'); p.add_argument('--match-only',action='store_true'); return p
@@ -17,13 +33,15 @@ def write_csv(path, rows):
  with path.open('w',newline='',encoding='utf-8') as f:
   w=csv.DictWriter(f,fieldnames=list(rows[0]) if rows else ['ticker']); w.writeheader(); w.writerows(rows)
 
-def workbook(path, rows, register):
- wb=Workbook(); ws=wb.active; ws.title='Summary'; headers=['ticker','target name','match status','match confidence','status','selected PDF','match warning','extraction notes']
+def workbook(path, rows, register, facilities=(), buckets=()):
+ wb=Workbook(); ws=wb.active; ws.title='Summary'; headers=['Ticker','Company name','Matched legal entity','Match status','Match confidence','Extraction status','Extraction confidence','Model used','Financial year','Report type','Balance date','Reporting currency','Gross debt ex leases','Current borrowings','Non-current borrowings','Undrawn committed headroom','Cash','Net debt'] + [f'{h} {x}' for h in HALVES for x in ('exact','inferred','total')] + ['2H27 maturity flag','Profile quality','Selected PDF','Match warning','Validation flags','Extraction notes']
  ws.append(headers)
- for r in rows: ws.append([r.get(x,'') for x in headers])
+ for r in rows:
+  values=[r.get(x,r.get(x.lower(),'')) for x in headers]; ws.append(values)
+  if r.get('selected PDF'): ws.cell(ws.max_row,headers.index('Selected PDF')+1).hyperlink=Path(r['selected PDF']).as_uri()
  for c in range(1,len(headers)+1): ws.column_dimensions[get_column_letter(c)].width=24
  ws.freeze_panes='A2'; ws.auto_filter.ref=ws.dimensions
- for name,data in [('Document Register',register),('Facilities',[]),('Buckets',[]),('Run Log',rows),('Exceptions',[r for r in rows if r['match status'] not in ACCEPTED])]:
+ for name,data in [('Facilities & Instruments',list(facilities)),('Disclosure Buckets',list(buckets)),('Document Register',register),('Exceptions',[r for r in rows if r['match status'] not in ACCEPTED]),('Run Log',rows)]:
   s=wb.create_sheet(name); h=list(data[0]) if data else ['ticker']; s.append(h)
   for r in data:s.append([r.get(x,'') for x in h])
   s.freeze_panes='A2'; s.auto_filter.ref=s.dimensions
