@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Iterable
 
 import fitz
-from rapidfuzz.fuzz import ratio
+try:
+    from rapidfuzz.fuzz import ratio
+except ImportError:  # keeps --help usable before optional runtime installation
+    from difflib import SequenceMatcher
+    def ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, a, b).ratio() * 100
 
 SUFFIXES = {"LIMITED","LTD","PTY","PROPRIETARY","HOLDINGS","GROUP","AUSTRALIA","AUSTRALIAN","TRUST","REIT","FUND","STAPLED","COMPANY","CORPORATION","THE"}
 BORROWING_WORDS = ("BORROWINGS", "FINANCING FACILITIES", "LOANS AND BORROWINGS", "INTEREST-BEARING")
