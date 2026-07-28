@@ -23,17 +23,18 @@ EXCLUDED_DESCRIPTIONS = (
     "NOTICE OF MEETING", "MEDIA RELEASE", "RESULTS PRESENTATION",
 )
 INDEX_FIELDS = [
-    "full_path", "filename", "filename_ticker", "release_date",
+    "index_parser_version", "full_path", "filename", "filename_ticker", "release_date",
     "financial_year", "document_description", "report_type",
     "filename_company", "acn", "file_size_bytes", "modified_time",
     "page_count", "first_pages_text", "normalised_filename_company",
     "index_error",
 ]
-_TICKER_PATTERN = re.compile(
-    r"^(?P<ticker>[A-Z0-9]{2,5})_(?P<date>\d{4}-\d{2}-\d{2})_"
-    r"FY(?P<fy>\d{2}|\d{4})_(?P<description>.+)$",
+INDEX_PARSER_VERSION = "3"
+_REPORT_FILENAME = re.compile(
+    r"^(?P<ticker>[A-Z0-9]{2,5})_(?P<release_date>\d{4}-\d{2}-\d{2})_(?P<title>.+)$",
     re.IGNORECASE,
 )
+_FINANCIAL_YEAR = re.compile(r"(?<![A-Z0-9])FY(?P<fy>20\d{2}|\d{2})(?!\d)", re.IGNORECASE)
 _LEGAL_PATTERN = re.compile(
     r"^(?P<company>.+)_FY(?P<fy>\d{4})_ACN(?P<acn>\d{9})$",
     re.IGNORECASE,
@@ -55,17 +56,24 @@ def normalise_name(value: str) -> str:
 
 
 def classify_report_type(description: str) -> str:
-    """Classify a filename description without treating presentations as reports."""
-    text = re.sub(r"[_-]+", " ", description).upper()
+    """Classify a freeform report title after punctuation normalisation."""
+    text = description.upper().replace("&", " AND ")
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    if any(excluded in text for excluded in EXCLUDED_DESCRIPTIONS):
-        return "OTHER"
-    annual = "ANNUAL REPORT" in text or "FULL YEAR" in text and "REPORT" in text
-    appendix_4e = "APPENDIX 4E" in text
+    annual = any(indicator in text for indicator in (
+        "ANNUAL REPORT", "FULL YEAR STATUTORY ACCOUNTS",
+        "FULL YEAR FINANCIAL STATEMENTS", "ANNUAL FINANCIAL REPORT",
+        "ANNUAL REPORT AND FINANCIAL STATEMENTS",
+    )) or "STATUTORY ACCOUNTS" in text and (
+        "FULL YEAR" in text or "APPENDIX 4E" in text
+    )
+    appendix_4e = "APPENDIX 4E" in text or annual and re.search(r"\b4E\b", text) is not None
     if annual and appendix_4e:
         return "ANNUAL_REPORT_AND_4E"
     if annual:
         return "ANNUAL_REPORT"
+    if any(excluded in text for excluded in EXCLUDED_DESCRIPTIONS):
+        return "OTHER"
     if appendix_4e:
         return "APPENDIX_4E"
     if "HALF YEAR" in text or "HALF YEARLY" in text or "INTERIM FINANCIAL REPORT" in text:
@@ -75,25 +83,49 @@ def classify_report_type(description: str) -> str:
     return "OTHER"
 
 
+def extract_financial_year(title: str) -> str:
+    """Extract a reporting year without inferring it from the release date."""
+    normalised = title.upper().replace("_", " ")
+    fy_match = _FINANCIAL_YEAR.search(normalised)
+    if fy_match:
+        year = fy_match.group("fy")
+        return f"20{year}" if len(year) == 2 else year
+
+    text = re.sub(r"[^A-Z0-9]+", " ", normalised)
+    association_patterns = (
+        r"\b(?P<year>20\d{2})\s+ANNUAL\s+REPORT\b",
+        r"\bANNUAL\s+REPORT(?:\s+TO\s+SHAREHOLDERS)?\s+(?P<year>20\d{2})\b",
+        r"\bYEAR\s+ENDED(?:\s+[A-Z0-9]+){0,6}\s+(?P<year>20\d{2})\b",
+        r"\b(?P<year>20\d{2})\s+FULL\s+YEAR\b",
+        r"\bFULL\s+YEAR(?:\s+[A-Z0-9]+){0,4}\s+(?P<year>20\d{2})\b",
+        r"\b(?P<year>20\d{2})\s+STATUTORY\s+ACCOUNTS\b",
+        r"\bSTATUTORY\s+ACCOUNTS(?:\s+[A-Z0-9]+){0,4}\s+(?P<year>20\d{2})\b",
+    )
+    for pattern in association_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group("year")
+    plausible = set(re.findall(r"\b20\d{2}\b", text))
+    return plausible.pop() if len(plausible) == 1 else ""
+
+
 def parse_report_filename(filename: str) -> dict[str, str]:
     """Parse ticker-prefixed reports and the older legal-name/ACN convention."""
     stem = Path(filename).stem
-    ticker_match = _TICKER_PATTERN.fullmatch(stem)
-    if ticker_match:
-        parts = ticker_match.groupdict()
-        year = parts["fy"]
-        financial_year = f"20{year}" if len(year) == 2 else year
-        description = parts["description"].replace("_", " ")
+    report_match = _REPORT_FILENAME.fullmatch(stem)
+    if report_match:
+        parts = report_match.groupdict()
         try:
-            release_date = date.fromisoformat(parts["date"]).isoformat()
+            release_date = date.fromisoformat(parts["release_date"]).isoformat()
         except ValueError:
             release_date = ""
+        description = parts["title"].replace("_", " ")
         return {
             "filename_ticker": parts["ticker"].upper(),
             "release_date": release_date,
-            "financial_year": financial_year,
+            "financial_year": extract_financial_year(parts["title"]),
             "document_description": description,
-            "report_type": classify_report_type(description),
+            "report_type": classify_report_type(parts["title"]),
             "filename_company": "",
             "acn": "",
         }
@@ -131,6 +163,7 @@ def _metadata(path: Path) -> dict:
         text, pages = "", 0
         error = f"PDF_UNREADABLE: {type(exc).__name__}: {exc}"
     return {
+        "index_parser_version": INDEX_PARSER_VERSION,
         "full_path": str(path), "filename": path.name, **parsed,
         "file_size_bytes": stat.st_size, "modified_time": int(stat.st_mtime),
         "page_count": pages, "first_pages_text": text[:12000],
@@ -149,8 +182,13 @@ def build_index(pdf_root: Path, output: Path, workers: int = 8) -> list[dict]:
     if output.exists():
         with output.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
-            if reader.fieldnames and set(INDEX_FIELDS).issubset(reader.fieldnames):
-                cached = {row["full_path"]: row for row in reader}
+            rows = list(reader)
+            if (
+                reader.fieldnames
+                and set(INDEX_FIELDS).issubset(reader.fieldnames)
+                and all(row.get("index_parser_version") == INDEX_PARSER_VERSION for row in rows)
+            ):
+                cached = {row["full_path"]: row for row in rows}
     paths = sorted(
         path for path in root.rglob("*")
         if path.is_file()
@@ -198,7 +236,6 @@ def _exact_sort_key(row: dict, identity: bool) -> tuple:
     return (
         row.get("report_type") in ANNUAL_TYPES,
         identity,
-        int(row.get("financial_year") or 0),
         row.get("release_date") or "",
         int(row.get("page_count") or 0),
     )
