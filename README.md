@@ -23,3 +23,10 @@ $env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $secureKey).Passwo
 python -m src.asx_maturity_screen --pilot --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen.xlsx"
 Remove-Item Env:OPENAI_API_KEY
 ```
+
+Extraction selects debt-related pages locally, sends only that targeted text to
+the configured OpenAI model, appends each completed result to
+`outputs\results.jsonl`, and reconstructs the six-sheet workbook. Use
+`--ticker IDX` to process one issuer, `--force` to rerun a successful result,
+or `--model MODEL_ID` to select an account-accessible structured-output model.
+Matching failures and ambiguous matches are never submitted for extraction.
