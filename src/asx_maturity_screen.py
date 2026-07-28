@@ -5,9 +5,10 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -32,7 +33,22 @@ KEYWORDS = (
     "maturities", "contractual maturities", "current borrowings",
     "non-current borrowings", "cash and cash equivalents", "net debt",
     "lease liabilities",
+    "facility agreement", "facility agreements", "entered into",
+    "financial close", "closed", "commencement", "commenced",
+    "effective date", "tenor", "term facility", "revolving facility",
+    "expiry", "expires", "refinancing", "refinanced",
 )
+
+MATURITY_BASES = Literal[
+    "EXACT_DATE", "MONTH_START_ASSUMPTION", "RANGE_START_MONTH",
+    "QUARTER_START_ASSUMPTION", "HALF_YEAR_START_ASSUMPTION",
+    "CALENDAR_YEAR_START_ASSUMPTION", "FINANCIAL_YEAR_START_ASSUMPTION",
+    "DISCLOSURE_BUCKET_START_ASSUMPTION", "TENOR_DERIVED", "UNDETERMINED",
+]
+TENOR_BASES = Literal[
+    "DISCLOSED", "DERIVED_FROM_DATES", "ASSUMED_FROM_SCREENING_DATE", "UNDETERMINED",
+]
+SCREENING_AMOUNT_BASES = Literal["DRAWN_AMOUNT", "FACILITY_LIMIT", "UNAVAILABLE"]
 
 
 class StrictModel(BaseModel):
@@ -55,8 +71,19 @@ class Facility(StrictModel):
     facility_limit: MoneyValue | None
     drawn_amount: MoneyValue | None
     undrawn_amount: MoneyValue | None
-    maturity_date: str | None
     maturity_description: str | None
+    exact_maturity_date: str | None
+    assumed_earliest_maturity_date: str | None
+    screening_maturity_date: str | None
+    screening_maturity_is_assumed: bool
+    maturity_assumption_basis: MATURITY_BASES
+    maturity_assumption_explanation: str | None
+    financial_close_date: str | None
+    tenor_months: int | None
+    tenor_description: str | None
+    tenor_basis: TENOR_BASES
+    screening_amount_m: float | None
+    screening_amount_basis: SCREENING_AMOUNT_BASES
     secured_or_unsecured: str | None
     current_or_non_current: str | None
     source_page: int | None
@@ -104,7 +131,8 @@ class ExtractionPayload(StrictModel):
 
 
 EXTRACTION_PROMPT = """Extract debt and maturity information from selected pages of an Australian statutory report.
-Return only facts supported by the supplied page text. Never guess. All monetary values must be converted to millions using the disclosed reporting unit, retain their currency, source page, and short source evidence. Use null for undisclosed fields. Exclude lease liabilities, derivatives not explicitly reported as borrowings, and trade payables from debt and maturities. Keep lease liabilities separately. Distinguish committed undrawn headroom from facility limits. Determine the balance date and financial year primarily from report contents. Preserve exact facilities separately from broad maturity buckets. Do not double count them. Dates must use YYYY-MM-DD when reliably disclosed. Page labels in the supplied text are the source page numbers."""
+Return only facts supported by the supplied page text. Never guess. All monetary values must be converted to millions using the disclosed reporting unit, retain their currency, source page, and short source evidence. Use null for undisclosed fields. Exclude lease liabilities, derivatives not explicitly reported as borrowings, and trade payables from debt and maturities. Keep lease liabilities separately. Distinguish committed undrawn headroom from facility limits. Determine the balance date and financial year primarily from report contents. Preserve exact facilities separately from broad maturity buckets. Do not double count them. Dates must use YYYY-MM-DD when reliably disclosed. Page labels in the supplied text are the source page numbers.
+For each facility preserve the complete maturity wording. Put a date in exact_maturity_date only when an exact day is disclosed. Extract financial_close_date and disclosed tenor independently. Do not copy maturity information between separate facilities. Leave assumed screening fields null/UNDETERMINED unless directly supported; deterministic application code will conservatively derive the earliest screening date and amount."""
 
 
 def parser() -> argparse.ArgumentParser:
@@ -200,6 +228,168 @@ def money(value: MoneyValue | None) -> float | None:
     return value.value_m if value else None
 
 
+MONTHS = {
+    name.upper(): number for number, name in enumerate(
+        ("January", "February", "March", "April", "May", "June", "July",
+         "August", "September", "October", "November", "December"), 1,
+    )
+}
+MONTH_PATTERN = "|".join(MONTHS)
+
+
+def add_months(value: date, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 + months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    next_month = date(year + (month == 12), 1 if month == 12 else month + 1, 1)
+    last_day = (next_month - timedelta(days=1)).day
+    return date(year, month, min(value.day, last_day))
+
+
+def months_between(start: date, end: date) -> int:
+    months = (end.year - start.year) * 12 + end.month - start.month
+    return months - (end.day < start.day)
+
+
+def _month_start(name: str, year: str) -> date:
+    return date(int(year), MONTHS[name.upper()], 1)
+
+
+def _financial_year_start(financial_year: int, balance_date: date) -> date:
+    prior_year_end = date(financial_year - 1, balance_date.month, balance_date.day)
+    return prior_year_end + timedelta(days=1)
+
+
+def _relative_bucket_start(description: str, balance_date: date) -> tuple[date | None, str | None]:
+    text = description.upper().replace("–", "-").replace("—", "-")
+    if re.search(r"\b(WITHIN|LESS THAN|UP TO)\s+(ONE|1)\s+YEAR\b", text):
+        return balance_date + timedelta(days=1), "within one year"
+    match = re.search(r"\b(ONE|1)\s+(?:TO|THROUGH|-)\s+(TWO|2)\s+YEARS?\b", text)
+    if match:
+        return add_months(balance_date, 12) + timedelta(days=1), "one to two years"
+    match = re.search(r"\b(TWO|2)\s+(?:TO|THROUGH|-)\s+(FIVE|5)\s+YEARS?\b", text)
+    if match:
+        return add_months(balance_date, 24) + timedelta(days=1), "two to five years"
+    return None, None
+
+
+def derive_facility_screening(facility: Facility, balance_date_value: str | None) -> Facility:
+    """Apply the conservative earliest-date and screening-amount hierarchy."""
+    balance_date = parse_date(balance_date_value)
+    description = facility.maturity_description or ""
+    exact = parse_date(facility.exact_maturity_date)
+    close = parse_date(facility.financial_close_date)
+    screening: date | None = None
+    basis: str = "UNDETERMINED"
+    explanation: str | None = None
+    assumed = False
+
+    if facility.tenor_months is None and facility.tenor_description:
+        years_match = re.search(r"\b(\d+(?:\.\d+)?)\s*[- ]?YEARS?\b", facility.tenor_description, re.IGNORECASE)
+        months_match = re.search(r"\b(\d+)\s*[- ]?MONTHS?\b", facility.tenor_description, re.IGNORECASE)
+        if years_match:
+            facility.tenor_months = round(float(years_match.group(1)) * 12)
+            facility.tenor_basis = "DISCLOSED"
+        elif months_match:
+            facility.tenor_months = int(months_match.group(1))
+            facility.tenor_basis = "DISCLOSED"
+
+    if exact:
+        screening, basis = exact, "EXACT_DATE"
+        explanation = "Exact maturity date disclosed for this facility."
+    else:
+        range_match = re.search(
+            rf"\b({MONTH_PATTERN})\s+(20\d{{2}})\s+(?:TO|THROUGH|UNTIL|-)\s+"
+            rf"({MONTH_PATTERN})\s+(20\d{{2}})\b",
+            description, re.IGNORECASE,
+        )
+        if range_match:
+            screening = _month_start(range_match.group(1), range_match.group(2))
+            basis, assumed = "RANGE_START_MONTH", True
+            explanation = (
+                "Earliest possible maturity month from the disclosed range; actual "
+                "maturities may occur anywhere within the range."
+            )
+        if not screening:
+            month_match = re.search(rf"\b({MONTH_PATTERN})\s+(20\d{{2}})\b", description, re.IGNORECASE)
+            if month_match:
+                screening = _month_start(month_match.group(1), month_match.group(2))
+                basis, assumed = "MONTH_START_ASSUMPTION", True
+                explanation = "First day of the disclosed maturity month."
+        if not screening:
+            quarter_match = re.search(r"\bQ([1-4])\s*(20\d{2})\b|\b(20\d{2})\s*Q([1-4])\b", description, re.IGNORECASE)
+            if quarter_match:
+                quarter = int(quarter_match.group(1) or quarter_match.group(4))
+                year = int(quarter_match.group(2) or quarter_match.group(3))
+                screening = date(year, 1 + (quarter - 1) * 3, 1)
+                basis, assumed = "QUARTER_START_ASSUMPTION", True
+                explanation = "First day of the disclosed calendar quarter."
+        if not screening:
+            half_match = re.search(r"\b([12])H\s*(20\d{2})\b|\b(20\d{2})\s*([12])H\b", description, re.IGNORECASE)
+            if half_match:
+                half = int(half_match.group(1) or half_match.group(4))
+                year = int(half_match.group(2) or half_match.group(3))
+                screening = date(year, 1 if half == 1 else 7, 1)
+                basis, assumed = "HALF_YEAR_START_ASSUMPTION", True
+                explanation = "First day of the disclosed calendar half."
+        if not screening:
+            financial_year_match = re.search(r"\bFY\s*(20\d{2}|\d{2})\b", description, re.IGNORECASE)
+            if financial_year_match and balance_date:
+                financial_year = int(financial_year_match.group(1))
+                if financial_year < 100:
+                    financial_year += 2000
+                screening = _financial_year_start(financial_year, balance_date)
+                basis, assumed = "FINANCIAL_YEAR_START_ASSUMPTION", True
+                explanation = "Start of the disclosed financial year based on the entity balance date."
+        if not screening:
+            years = set(re.findall(r"\b20\d{2}\b", description))
+            if len(years) == 1:
+                screening = date(int(next(iter(years))), 1, 1)
+                basis, assumed = "CALENDAR_YEAR_START_ASSUMPTION", True
+                explanation = "First day of the only disclosed calendar maturity year."
+        if not screening and balance_date:
+            screening, bucket = _relative_bucket_start(description, balance_date)
+            if screening:
+                basis, assumed = "DISCLOSURE_BUCKET_START_ASSUMPTION", True
+                explanation = f"Earliest date in the disclosed relative bucket ({bucket})."
+        if not screening and close and facility.tenor_months is not None and facility.tenor_months >= 0:
+            screening = add_months(close, facility.tenor_months)
+            basis, assumed = "TENOR_DERIVED", True
+            explanation = "Derived from disclosed financial close date plus disclosed tenor."
+
+    if close and exact:
+        facility.tenor_months = months_between(close, exact)
+        facility.tenor_basis = "DERIVED_FROM_DATES"
+    elif close and screening and facility.tenor_months is None:
+        facility.tenor_months = months_between(close, screening)
+        facility.tenor_basis = "ASSUMED_FROM_SCREENING_DATE"
+
+    drawn, limit = money(facility.drawn_amount), money(facility.facility_limit)
+    if drawn is not None:
+        facility.screening_amount_m = drawn
+        facility.screening_amount_basis = "DRAWN_AMOUNT"
+    elif limit is not None:
+        facility.screening_amount_m = limit
+        facility.screening_amount_basis = "FACILITY_LIMIT"
+    else:
+        facility.screening_amount_m = None
+        facility.screening_amount_basis = "UNAVAILABLE"
+    facility.exact_maturity_date = exact.isoformat() if exact else None
+    facility.assumed_earliest_maturity_date = screening.isoformat() if screening and assumed else None
+    facility.screening_maturity_date = screening.isoformat() if screening else None
+    facility.screening_maturity_is_assumed = assumed
+    facility.maturity_assumption_basis = basis
+    facility.maturity_assumption_explanation = explanation
+    return facility
+
+
+def apply_facility_screening(payload: ExtractionPayload) -> None:
+    payload.facilities = [
+        derive_facility_screening(facility, payload.balance_date)
+        for facility in payload.facilities
+    ]
+
+
 def select_relevant_pages(pdf_path: Path, maximum: int = 16) -> tuple[list[int], list[str]]:
     """Extract all text locally, then retain keyword pages and their neighbours."""
     with fitz.open(pdf_path) as document:
@@ -291,7 +481,7 @@ def validate_extraction(payload: ExtractionPayload, filename_year: str | None) -
     balance_date = parse_date(payload.balance_date)
     if balance_date:
         for facility in payload.facilities:
-            maturity = parse_date(facility.maturity_date)
+            maturity = parse_date(facility.screening_maturity_date)
             if maturity and maturity < balance_date:
                 flags.append("MATURITY_BEFORE_BALANCE_DATE")
     if not payload.reporting_currency:
@@ -308,26 +498,31 @@ def validate_extraction(payload: ExtractionPayload, filename_year: str | None) -
     if payload.extraction_confidence < 0.60:
         flags.append("LOW_CONFIDENCE")
     if payload.facilities and any(
-        money(facility.drawn_amount) is not None and not facility.maturity_date
+        facility.screening_amount_m is not None and not facility.screening_maturity_date
         for facility in payload.facilities
     ):
         flags.append("MATURITY_PROFILE_INCOMPLETE")
+    if any(facility.maturity_assumption_basis == "RANGE_START_MONTH" for facility in payload.facilities):
+        flags.append("MATURITY_RANGE_EARLIEST_DATE_ASSUMPTION")
     return list(dict.fromkeys(flags))
 
 
 def maturity_grid(payload: ExtractionPayload) -> tuple[dict[str, float | None], str]:
     exact = {half: None for half in HALVES}
     inferred = {half: None for half in HALVES}
+    facility_allocation_found = False
     exact_found = False
     for facility in payload.facilities:
-        amount = money(facility.drawn_amount)
-        allocation = allocate_exact(amount, facility.maturity_date)
+        amount = facility.screening_amount_m
+        allocation = allocate_exact(amount, facility.screening_maturity_date)
         for half, value in allocation.items():
             if value is not None:
-                exact[half] = (exact[half] or 0) + value
-                exact_found = True
-    if exact_found:
-        quality = "FACILITY_DATED"
+                target = inferred if facility.screening_maturity_is_assumed else exact
+                target[half] = (target[half] or 0) + value
+                facility_allocation_found = True
+                exact_found = exact_found or not facility.screening_maturity_is_assumed
+    if facility_allocation_found:
+        quality = "FACILITY_DATED" if exact_found else "BUCKET_INFERRED"
     else:
         for bucket in payload.disclosure_buckets:
             allocation = allocate_bucket_dates(money(bucket.amount), bucket.period_start, bucket.period_end)
@@ -397,6 +592,29 @@ def build_record(
     }
 
 
+def nearest_screening_maturity(extraction: dict) -> dict:
+    facilities = extraction.get("facilities", [])
+    dated = [
+        facility for facility in facilities
+        if parse_date(facility.get("screening_maturity_date"))
+    ]
+    if not dated:
+        return {}
+    nearest = min(dated, key=lambda facility: parse_date(facility["screening_maturity_date"]))
+    return {
+        "Nearest screening maturity date": nearest.get("screening_maturity_date"),
+        "Nearest screening maturity assumed": nearest.get("screening_maturity_is_assumed"),
+        "Nearest maturity assumption basis": nearest.get("maturity_assumption_basis"),
+        "Nearest maturity facility": nearest.get("facility_or_instrument_name"),
+        "Amount potentially maturing": nearest.get("screening_amount_m"),
+        "Amount basis": nearest.get("screening_amount_basis"),
+        "Facility limit at nearest maturity": (nearest.get("facility_limit") or {}).get("value_m"),
+        "Drawn amount at nearest maturity": (nearest.get("drawn_amount") or {}).get("value_m"),
+        "Upcoming maturity flag": "Y",
+        "Upcoming maturity confidence": nearest.get("confidence"),
+    }
+
+
 def summary_row(record: dict) -> dict:
     match = record["document_match"]
     extraction = record.get("extraction") or {}
@@ -423,6 +641,7 @@ def summary_row(record: dict) -> dict:
         "Source pages": ", ".join(map(str, record.get("selected_pages", []))),
         "Validation flags": " | ".join(record.get("validation_flags", [])),
         "Extraction notes": extraction.get("extraction_notes") or record.get("error", ""),
+        **nearest_screening_maturity(extraction),
     }
     return row
 
@@ -432,17 +651,26 @@ SUMMARY_HEADERS = [
     "Extraction status", "Extraction confidence", "Model used", "Financial year", "Report type",
     "Balance date", "Reporting currency", "Gross debt ex leases", "Current borrowings",
     "Non-current borrowings", "Undrawn committed headroom", "Cash", "Net debt",
+] + [
+    "Nearest screening maturity date", "Nearest screening maturity assumed",
+    "Nearest maturity assumption basis", "Nearest maturity facility",
+    "Amount potentially maturing", "Amount basis", "Facility limit at nearest maturity",
+    "Drawn amount at nearest maturity", "Upcoming maturity flag", "Upcoming maturity confidence",
 ] + [f"{half} {kind}" for half in HALVES for kind in ("exact", "inferred", "total")] + [
     "2H27 maturity total", "2H27 maturity flag", "Profile quality", "Selected PDF",
     "Source pages", "Validation flags", "Extraction notes",
 ]
 FACILITY_HEADERS = [
-    "company_name", "selected_pdf", "ticker", "facility_or_instrument_name",
-    "lender_or_market", "instrument_type", "currency", "maturity_date",
-    "maturity_description", "secured_or_unsecured", "current_or_non_current",
-    "source_page", "source_quote_or_evidence", "confidence", "facility_limit_m",
-    "facility_limit_source_page", "drawn_amount_m", "drawn_amount_source_page",
-    "undrawn_amount_m", "undrawn_amount_source_page",
+    "ticker", "company_name", "facility_or_instrument_name", "instrument_type",
+    "currency", "financial_close_date", "tenor_months", "tenor_description",
+    "tenor_basis", "exact_maturity_date", "assumed_earliest_maturity_date",
+    "screening_maturity_date", "screening_maturity_is_assumed",
+    "maturity_assumption_basis", "maturity_assumption_explanation",
+    "facility_limit_m", "drawn_amount_m", "undrawn_amount_m", "screening_amount_m",
+    "screening_amount_basis", "source_page", "source_quote_or_evidence", "confidence",
+    "lender_or_market", "maturity_description", "secured_or_unsecured",
+    "current_or_non_current", "facility_limit_source_page", "drawn_amount_source_page",
+    "undrawn_amount_source_page", "selected_pdf",
 ]
 BUCKET_HEADERS = [
     "company_name", "selected_pdf", "ticker", "bucket_label", "period_start",
@@ -506,11 +734,19 @@ def workbook(path: Path, records: list[dict], register: list[dict]) -> None:
         sheet = book.create_sheet(name)
         sheet.append(headers)
         for row in rows:
-            sheet.append([row.get(header) for header in headers])
+            values = []
+            for header in headers:
+                value = row.get(header)
+                parsed_value = parse_date(value) if header.lower().endswith("date") else None
+                values.append(parsed_value or value)
+            sheet.append(values)
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
         for column in range(1, len(headers) + 1):
             sheet.column_dimensions[get_column_letter(column)].width = min(45, max(12, len(headers[column - 1]) + 2))
+            if headers[column - 1].lower().endswith("date"):
+                for row_number in range(2, sheet.max_row + 1):
+                    sheet.cell(row_number, column).number_format = "dd/mm/yyyy"
         if name == "Summary":
             inferred_fill = PatternFill("solid", fgColor="D9D9D9")
             for column, header in enumerate(headers, 1):
@@ -595,6 +831,7 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
             if payload:
                 payload.source_pages = sorted(set(payload.source_pages) | set(source_pages))
                 payload.model_used = args.model
+                apply_facility_screening(payload)
                 flags = validate_extraction(payload, item.get("financial_year"))
                 grid, quality = maturity_grid(payload)
                 status = "EXTRACTED_WITH_FLAGS" if flags else "EXTRACTED"

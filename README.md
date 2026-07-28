@@ -30,3 +30,7 @@ the configured OpenAI model, appends each completed result to
 `--ticker IDX` to process one issuer, `--force` to rerun a successful result,
 or `--model MODEL_ID` to select an account-accessible structured-output model.
 Matching failures and ambiguous matches are never submitted for extraction.
+Facility screening distinguishes exact maturity dates from conservative assumed
+earliest dates derived from disclosed months, ranges, quarters, halves, years,
+relative buckets, or close-date/tenor evidence. Assumed dates populate only the
+inferred maturity grid and retain their assumption basis and explanation.

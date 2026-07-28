@@ -50,7 +50,13 @@ def _facility(drawn: float = 100) -> Facility:
         ticker="IDX", facility_or_instrument_name="Syndicated facility",
         lender_or_market=None, instrument_type="BANK_FACILITY", currency="AUD",
         facility_limit=_money(120), drawn_amount=_money(drawn), undrawn_amount=_money(20),
-        maturity_date="2027-10-15", maturity_description="October 2027",
+        maturity_description="15 October 2027", exact_maturity_date="2027-10-15",
+        assumed_earliest_maturity_date=None, screening_maturity_date="2027-10-15",
+        screening_maturity_is_assumed=False, maturity_assumption_basis="EXACT_DATE",
+        maturity_assumption_explanation="Exact maturity date disclosed.",
+        financial_close_date=None, tenor_months=None, tenor_description=None,
+        tenor_basis="UNDETERMINED", screening_amount_m=drawn,
+        screening_amount_basis="DRAWN_AMOUNT",
         secured_or_unsecured="UNSECURED", current_or_non_current="NON_CURRENT",
         source_page=1, source_quote_or_evidence="Facility matures October 2027",
         confidence=0.9,
@@ -159,7 +165,7 @@ def test_resumability_force_ticker_and_workbook(monkeypatch, tmp_path: Path, cap
     for required in ("Gross debt ex leases", "2H27 exact", "2H27 inferred", "2H27 total", "Source pages"):
         assert required in headers
     facility_headers = [cell.value for cell in book["Facilities & Instruments"][1]]
-    for required in ("facility_or_instrument_name", "drawn_amount_m", "maturity_date", "source_page"):
+    for required in ("facility_or_instrument_name", "drawn_amount_m", "screening_maturity_date", "source_page"):
         assert required in facility_headers
     bucket_headers = [cell.value for cell in book["Disclosure Buckets"][1]]
     for required in ("bucket_label", "period_start", "period_end", "amount_m"):
