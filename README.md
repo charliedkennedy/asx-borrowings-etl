@@ -1,43 +1,25 @@
 # ASX Borrowings ETL
 
-## Install
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+## Statutory maturity screen
+
+## Local Windows PDF workflow
+
+`src.asx_maturity_screen` is a **local-PDF-only** pipeline. It reads source
+documents exclusively from the directory supplied with `--pdf-root`; it has no
+web discovery, download, or fallback capability. It indexes financial-statement
+PDFs under the supplied directory, writes `outputs\\pdf_index.csv`, ranks
+candidates, and writes `outputs\\document_match_candidates.csv` and
+`outputs\\document_register.csv`.
+
+```powershell
+python -m src.asx_maturity_screen --pilot --match-only --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv
 ```
 
-## Input file
-Create `tickers.csv` with columns:
-- `ticker`
-- `company_name`
+For extraction after reviewing the register, set the credential without echoing it and run the pilot:
 
-## Run full process
-```bash
-python src/main.py --input tickers.csv --output outputs --pdf-cache pdf_cache
+```powershell
+$secureKey = Read-Host "OpenAI API key" -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $secureKey).Password
+python -m src.asx_maturity_screen --pilot --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen.xlsx"
+Remove-Item Env:OPENAI_API_KEY
 ```
-
-## Rerun extraction using edited source register
-```bash
-python src/main.py --input tickers.csv --skip-source-discovery --source-register outputs/source_register.csv --output outputs --pdf-cache pdf_cache
-```
-
-## Outputs
-- `outputs/source_register.csv`
-- `outputs/borrowings_maturity_profile.csv`
-- `outputs/borrowings_maturity_profile.xlsx`
-- `outputs/exceptions_report.csv`
-- `outputs/snippets/`
-- `outputs/logs/`
-- `pdf_cache/`
-
-## Status labels
-- `source not located`
-- `report located but borrowings not found`
-- `nil borrowings`
-- `current/non-current extracted, maturity not disclosed`
-- `current/non-current extracted, partial maturity extracted`
-- `full maturity profile extracted`
-- `extraction unclear, manual review required`
-
-Use manual review flag and exceptions report for verification.
