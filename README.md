@@ -34,3 +34,30 @@ Facility screening distinguishes exact maturity dates from conservative assumed
 earliest dates derived from disclosed months, ranges, quarters, halves, years,
 relative buckets, or close-date/tenor evidence. Assumed dates populate only the
 inferred maturity grid and retain their assumption basis and explanation.
+Debt is stored as parent agreements with separate child tranches or instruments.
+Agreement totals are repeated only for workbook context and are deduplicated in
+issuer totals; unallocated agreement amounts are never copied into tranche
+maturity buckets.
+
+## Six-name validation gate
+
+Run matching first without an API key:
+
+```powershell
+python -m src.asx_maturity_screen --tickers IDX ORA KPG CMW ALQ WGN --match-only --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen.xlsx"
+```
+
+Inspect `outputs\document_register.csv`. Extraction is blocked unless every
+issuer selected through `--tickers` is `MATCHED_HIGH`. After all six matches are
+confirmed, enter the key without echoing it and force a fresh six-name run:
+
+```powershell
+$secureKey = Read-Host "OpenAI API key" -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $secureKey).Password
+python -m src.asx_maturity_screen --tickers IDX ORA KPG CMW ALQ WGN --force --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen.xlsx"
+Remove-Item Env:OPENAI_API_KEY
+```
+
+Review agreement/tranche separation, amount allocation, exact versus inferred
+dates, committed capacity, comparatives, reconciliations, evidence, and flags
+before expanding beyond this cohort.

@@ -6,8 +6,9 @@ from openpyxl import load_workbook
 
 from src.asx_maturity_screen import (
     DisclosureBucket,
+    DebtAgreement,
+    DebtTranche,
     ExtractionPayload,
-    Facility,
     MoneyValue,
     SUCCESS_STATUSES,
     main_for_args,
@@ -26,7 +27,7 @@ def _money(value: float | None, page: int = 1) -> MoneyValue:
 
 
 def _payload(
-    ticker: str = "IDX", facilities: list[Facility] | None = None,
+    ticker: str = "IDX", facilities: list[DebtTranche] | None = None,
     buckets: list[DisclosureBucket] | None = None,
 ) -> ExtractionPayload:
     return ExtractionPayload(
@@ -38,28 +39,43 @@ def _payload(
         non_current_borrowings_excluding_leases=_money(60),
         undrawn_committed_headroom=_money(20), cash_and_cash_equivalents=_money(10),
         net_debt_excluding_leases=_money(90), lease_liabilities=_money(15),
-        facilities=facilities or [], disclosure_buckets=buckets or [],
+        debt_agreements=[_agreement(ticker, facilities)] if facilities else [], disclosure_buckets=buckets or [],
         extraction_confidence=0.9, extraction_status="EXTRACTED", model_used="mock-model",
         source_pages=[1], extraction_notes="Lease liabilities were separately excluded.",
         validation_flags=[], profile_quality=None, leases_apparently_included=False,
     )
 
 
-def _facility(drawn: float = 100) -> Facility:
-    return Facility(
-        ticker="IDX", facility_or_instrument_name="Syndicated facility",
-        lender_or_market=None, instrument_type="BANK_FACILITY", currency="AUD",
-        facility_limit=_money(120), drawn_amount=_money(drawn), undrawn_amount=_money(20),
+def _facility(drawn: float = 100) -> DebtTranche:
+    return DebtTranche(
+        parent_agreement_id="", ticker="IDX", tranche_name="Syndicated facility",
+        tranche_description=None, tranche_instrument_type="BANK_FACILITY", tranche_currency="AUD",
+        tranche_limit=_money(120), tranche_drawn_amount=_money(drawn), tranche_undrawn_amount=_money(20),
         maturity_description="15 October 2027", exact_maturity_date="2027-10-15",
+        derived_maturity_date=None, maturity_reference_date=None, maturity_reference_type="UNDETERMINED",
         assumed_earliest_maturity_date=None, screening_maturity_date="2027-10-15",
         screening_maturity_is_assumed=False, maturity_assumption_basis="EXACT_DATE",
         maturity_assumption_explanation="Exact maturity date disclosed.",
-        financial_close_date=None, tenor_months=None, tenor_description=None,
+        tenor_months=None, tenor_description=None,
         tenor_basis="UNDETERMINED", screening_amount_m=drawn,
-        screening_amount_basis="DRAWN_AMOUNT",
-        secured_or_unsecured="UNSECURED", current_or_non_current="NON_CURRENT",
+        screening_amount_basis="TRANCHE_DRAWN_AMOUNT", amount_allocation_status="TRANCHE_LEVEL_DISCLOSED",
         source_page=1, source_quote_or_evidence="Facility matures October 2027",
         confidence=0.9,
+    )
+
+
+def _agreement(ticker: str, facilities: list[DebtTranche]) -> DebtAgreement:
+    drawn_total = sum(item.tranche_drawn_amount.value_m for item in facilities if item.tranche_drawn_amount)
+    return DebtAgreement(
+        agreement_id="mock", ticker=ticker, agreement_name="Syndicated agreement",
+        agreement_description=None, lender_or_market=None, instrument_type="BANK_FACILITY",
+        currency="AUD", secured_or_unsecured="UNSECURED", agreement_facility_limit=_money(120),
+        agreement_drawn_amount=_money(drawn_total), agreement_undrawn_amount=_money(120 - drawn_total),
+        committed_or_uncommitted="COMMITTED", refinancing_date=None, refinancing_date_basis=None,
+        effective_date=None, effective_date_basis=None, financial_close_date=None,
+        financial_close_date_basis=None, agreement_source_page=1,
+        agreement_source_quote_or_evidence="Syndicated agreement", confidence=0.9,
+        is_current_period=True, tranches=facilities,
     )
 
 
@@ -151,8 +167,15 @@ def test_resumability_force_ticker_and_workbook(monkeypatch, tmp_path: Path, cap
     assert calls == ["IDX"]
     assert main_for_args(command, extractor=extractor) == 0
     assert calls == ["IDX"]
-    assert main_for_args([*command, "--force"], extractor=extractor) == 0
+    results_path = output.parent / "results.jsonl"
+    stale = json.loads(results_path.read_text().splitlines()[-1])
+    stale["extraction_schema_version"] = 1
+    with results_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(stale) + "\n")
+    assert main_for_args(command, extractor=extractor) == 0
     assert calls == ["IDX", "IDX"]
+    assert main_for_args([*command, "--force"], extractor=extractor) == 0
+    assert calls == ["IDX", "IDX", "IDX"]
     captured = capsys.readouterr()
     assert "test-secret-must-not-be-logged" not in captured.out + captured.err
 
@@ -165,14 +188,14 @@ def test_resumability_force_ticker_and_workbook(monkeypatch, tmp_path: Path, cap
     for required in ("Gross debt ex leases", "2H27 exact", "2H27 inferred", "2H27 total", "Source pages"):
         assert required in headers
     facility_headers = [cell.value for cell in book["Facilities & Instruments"][1]]
-    for required in ("facility_or_instrument_name", "drawn_amount_m", "screening_maturity_date", "source_page"):
+    for required in ("agreement_id", "tranche_name", "tranche_drawn_amount_m", "screening_maturity_date", "source_page"):
         assert required in facility_headers
     bucket_headers = [cell.value for cell in book["Disclosure Buckets"][1]]
     for required in ("bucket_label", "period_start", "period_end", "amount_m"):
         assert required in bucket_headers
     selected_column = headers.index("Selected PDF") + 1
     assert book["Summary"].cell(2, selected_column).hyperlink is not None
-    records = [json.loads(line) for line in (output.parent / "results.jsonl").read_text().splitlines()]
+    records = [json.loads(line) for line in results_path.read_text().splitlines()]
     assert records[-1]["status"] in SUCCESS_STATUSES
     assert records[-1]["extraction"]["lease_liabilities"]["value_m"] == 15
 
