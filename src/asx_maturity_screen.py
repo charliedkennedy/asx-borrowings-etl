@@ -184,9 +184,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--pdf-root", required=True)
     result.add_argument("--targets", required=True)
     result.add_argument("--output", default="outputs/asx_maturity_screen.xlsx")
-    result.add_argument("--pilot", action="store_true")
+    selection = result.add_mutually_exclusive_group()
+    selection.add_argument("--pilot", action="store_true")
+    selection.add_argument("--ticker", type=str.upper)
+    selection.add_argument("--tickers", nargs="+", type=str.upper, metavar="TICKER")
     result.add_argument("--match-only", action="store_true")
-    result.add_argument("--ticker", type=str.upper)
     result.add_argument("--force", action="store_true")
     result.add_argument("--model", default="gpt-4.1-mini")
     return result
@@ -1039,18 +1041,38 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
     output_path = Path(args.output)
     output_dir = output_path.parent
     pdf_root = Path(args.pdf_root).resolve(strict=True)
-    indexed = build_index(pdf_root, output_dir / "pdf_index.csv")
     targets = read_targets(Path(args.targets))
+    target_by_ticker = {target["ticker"]: target for target in targets}
     if args.pilot:
         targets = [target for target in targets if target["ticker"] in PILOT]
-    if args.ticker:
-        targets = [target for target in targets if target["ticker"] == args.ticker]
+    elif args.ticker:
+        requested = [args.ticker]
+        missing = [ticker for ticker in requested if ticker not in target_by_ticker]
+        if missing:
+            raise SystemExit(f"Requested ticker absent from targets.csv: {', '.join(missing)}")
+        targets = [target_by_ticker[ticker] for ticker in requested]
+    elif args.tickers:
+        requested = list(dict.fromkeys(args.tickers))
+        missing = [ticker for ticker in requested if ticker not in target_by_ticker]
+        if missing:
+            raise SystemExit(f"Requested ticker(s) absent from targets.csv: {', '.join(missing)}")
+        targets = [target_by_ticker[ticker] for ticker in requested]
+    indexed = build_index(pdf_root, output_dir / "pdf_index.csv")
     candidates, register = match_targets(targets, indexed)
     write_csv(output_dir / "document_match_candidates.csv", candidates)
     write_csv(output_dir / "document_register.csv", register)
     if args.match_only:
         print(f"Local matching complete: {output_dir / 'document_register.csv'}")
         return 0
+    if args.tickers:
+        not_high = [item["ticker"] for item in register if item["match_status"] != "MATCHED_HIGH"]
+        if not_high:
+            print(
+                "Multi-ticker extraction stopped: every requested issuer must be MATCHED_HIGH. "
+                f"Review document_register.csv for: {', '.join(not_high)}",
+                file=sys.stderr,
+            )
+            return 3
     accepted = [item for item in register if item["match_status"] in ACCEPTED]
     api_key = os.getenv("OPENAI_API_KEY")
     if accepted and not api_key:
