@@ -2,7 +2,7 @@ PyMuPDF>=1.24,<2
 openpyxl>=3.1,<4
 pydantic>=2.7,<3
 tenacity>=8.2,<10
-openai>=1.0,<2
+openai>=1.109,<2
 pytest>=8,<9
 # Dependencies retained for the legacy `src/main.py` entry point.
 pandas>=2.0,<3

@@ -157,6 +157,7 @@ def test_resumability_force_ticker_and_workbook(monkeypatch, tmp_path: Path, cap
     calls: list[str] = []
 
     def extractor(ticker, *args):
+        assert output.exists(), "initial workbook must precede the first model call"
         calls.append(ticker)
         payload = _payload(ticker=ticker, facilities=[_facility()])
         payload.ticker = ticker

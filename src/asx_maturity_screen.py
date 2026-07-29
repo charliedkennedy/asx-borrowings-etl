@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Callable, Literal
 
 import fitz
-from openai import OpenAI
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
@@ -26,7 +25,15 @@ from .local_pdf_index import build_index, match_targets, read_targets
 PILOT = ("IDX", "MTS", "EVT", "XRO", "BSL", "CHC", "DMP", "GNC", "S32", "TAH")
 ACCEPTED = {"MATCHED_HIGH", "MATCHED_MEDIUM"}
 SUCCESS_STATUSES = {"EXTRACTED", "EXTRACTED_WITH_FLAGS"}
-EXTRACTION_SCHEMA_VERSION = 2
+EXTRACTION_SCHEMA_VERSION = 3
+DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_RETRY_MODEL = "gpt-5.6-terra"
+# Usage-based safety estimates only; they are not invoice quotes.
+MODEL_PRICING_USD_PER_MILLION = {
+    "gpt-5.6-luna": {"input": 0.50, "cached_input": 0.05, "output": 4.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+}
+CONSERVATIVE_ISSUER_RESERVE_USD = 0.25
 HALVES = ("2H26", "1H27", "2H27", "1H28", "2H28", "FY29+")
 KEYWORDS = (
     "borrowings", "loans and borrowings", "interest-bearing liabilities",
@@ -101,6 +108,7 @@ class DebtTranche(StrictModel):
     maturity_assumption_basis: MATURITY_BASES
     maturity_assumption_explanation: str | None
     screening_amount_m: float | None
+    screening_amount_currency: str | None = None
     screening_amount_basis: SCREENING_AMOUNT_BASES
     amount_allocation_status: AMOUNT_ALLOCATION_STATUSES
     source_page: int | None
@@ -176,7 +184,7 @@ class ExtractionPayload(StrictModel):
 EXTRACTION_PROMPT = """Extract debt and maturity information from selected pages of an Australian statutory report.
 Return only facts supported by the supplied page text. Never guess. All monetary values must be converted to millions using the disclosed reporting unit, retain their currency, source page, and short source evidence. Use null for undisclosed fields. Exclude lease liabilities, derivatives not explicitly reported as borrowings, and trade payables from debt and maturities. Keep lease liabilities separately. Distinguish committed undrawn headroom from facility limits. Determine the balance date and financial year primarily from report contents. Preserve exact facilities separately from broad maturity buckets. Do not double count them. Dates must use YYYY-MM-DD when reliably disclosed. Page labels in the supplied text are the source page numbers.
 One agreement may contain multiple tranches. Create a separate tranche for every different name, series, currency, instrument type, tenor, maturity, amount, lender group, or security ranking. Never combine Facility A and Facility B or multiple bond/private-placement series. Distinguish agreement-level amounts from tranche-level amounts and never allocate agreement totals across tranches without source evidence. Distinguish committed capacity from uncommitted accordions and exclude uncommitted capacity from debt and liquidity totals. Extract only the current reporting period; do not create records from prior-year comparatives.
-Keep reporting, refinancing, effective, commencement, financial-close, maturity-reference, exact maturity, and derived maturity dates separate. A reporting or balance date is not a maturity date. Preserve complete source wording for every agreement and tranche. Put a date in exact_maturity_date only when an exact contractual day is directly disclosed. Extract a remaining-tenor reference date and type where stated. Do not copy maturity information between separate tranches. Use null for unsupported values; deterministic post-processing will derive conservative screening fields."""
+Keep reporting, refinancing, effective, commencement, financial-close, maturity-reference, exact maturity, and derived maturity dates separate. A reporting or balance date is not a maturity date. Words such as matures, maturing, due, expires, expiry, and repayable on introduce a direct maturity, never a tenor reference date. A disclosed maturity month must not have an original tenor added to it. Only derive from a tenor when a genuine start/reference date is explicitly disclosed and no direct maturity overrides it. Preserve complete source wording for every agreement and tranche. Put a date in exact_maturity_date only when an exact contractual day is directly disclosed. Extract a remaining-tenor reference date and type where stated. Do not copy maturity information between separate tranches. Use null for unsupported values; deterministic post-processing will derive conservative screening fields."""
 
 
 def parser() -> argparse.ArgumentParser:
@@ -190,7 +198,9 @@ def parser() -> argparse.ArgumentParser:
     selection.add_argument("--tickers", nargs="+", type=str.upper, metavar="TICKER")
     result.add_argument("--match-only", action="store_true")
     result.add_argument("--force", action="store_true")
-    result.add_argument("--model", default="gpt-4.1-mini")
+    result.add_argument("--model", default=DEFAULT_MODEL)
+    result.add_argument("--retry-model", default=DEFAULT_RETRY_MODEL)
+    result.add_argument("--max-api-cost-usd", type=float)
     return result
 
 
@@ -280,6 +290,7 @@ MONTHS = {
          "August", "September", "October", "November", "December"), 1,
     )
 }
+MONTHS.update({name[:3].upper(): number for name, number in list(MONTHS.items())})
 MONTH_PATTERN = "|".join(MONTHS)
 
 
@@ -298,7 +309,20 @@ def months_between(start: date, end: date) -> int:
 
 
 def _month_start(name: str, year: str) -> date:
-    return date(int(year), MONTHS[name.upper()], 1)
+    numeric_year = int(year)
+    if numeric_year < 100:
+        numeric_year += 2000
+    return date(numeric_year, MONTHS[name.upper()], 1)
+
+
+def direct_maturity_month(description: str) -> date | None:
+    """Return a directly disclosed maturity/expiry month, never a reference date."""
+    match = re.search(
+        rf"\b(?:MATURES?|MATURING|DUE|EXPIRES?|EXPIRY|REPAYABLE\s+ON)\b"
+        rf"(?:\s+IN|\s+ON|\s*[:,-])?\s+({MONTH_PATTERN})[-\s]+(20\d{{2}}|\d{{2}})\b",
+        description, re.IGNORECASE,
+    )
+    return _month_start(match.group(1), match.group(2)) if match else None
 
 
 def parse_text_date(text: str) -> date | None:
@@ -368,6 +392,7 @@ def derive_tranche_screening(
     balance_date = parse_date(balance_date_value)
     description = tranche.maturity_description or tranche.tranche_description or ""
     exact = parse_date(tranche.exact_maturity_date)
+    disclosed_month = direct_maturity_month(description)
     screening: date | None = None
     basis: str = "UNDETERMINED"
     explanation: str | None = None
@@ -378,7 +403,7 @@ def derive_tranche_screening(
     reference = parse_date(tranche.maturity_reference_date)
     if not reference and tranche.tenor_months is not None:
         reference_phrase = re.search(
-            r"\b(REPORTING DATE|BALANCE DATE|AS AT|MEASURED FROM|FROM|AFTER|FOLLOWING|COMMENCING ON|EFFECTIVE FROM)\b(.{0,45})",
+            r"\b(REPORTING DATE|BALANCE DATE|AS AT|MEASURED FROM|ENTERED INTO ON|ENTERED INTO|FROM|AFTER|FOLLOWING|COMMENCING ON|EFFECTIVE FROM)\b(.{0,45})",
             description, re.IGNORECASE,
         )
         if reference_phrase:
@@ -389,7 +414,7 @@ def derive_tranche_screening(
                     "BALANCE_DATE" if phrase in {"BALANCE DATE", "AS AT"}
                     else "REPORTING_DATE" if phrase == "REPORTING DATE"
                     else "EFFECTIVE_DATE" if phrase == "EFFECTIVE FROM"
-                    else "COMMENCEMENT_DATE" if phrase == "COMMENCING ON"
+                    else "COMMENCEMENT_DATE" if phrase in {"COMMENCING ON", "ENTERED INTO ON", "ENTERED INTO"}
                     else "OTHER_DISCLOSED_REFERENCE"
                 )
                 tranche.maturity_reference_date = reference.isoformat()
@@ -409,6 +434,11 @@ def derive_tranche_screening(
     if exact:
         screening, basis = exact, "EXACT_DATE"
         explanation = "Exact maturity date disclosed for this facility."
+        tranche.derived_maturity_date = None
+    elif disclosed_month:
+        screening, basis, assumed = disclosed_month, "MONTH_START_ASSUMPTION", True
+        explanation = "First day of the directly disclosed contractual maturity month."
+        tranche.exact_maturity_date = None
         tranche.derived_maturity_date = None
     elif reference and tranche.tenor_months is not None:
         derived = add_months(reference, tranche.tenor_months)
@@ -480,18 +510,22 @@ def derive_tranche_screening(
     drawn, limit = money(tranche.tranche_drawn_amount), money(tranche.tranche_limit)
     if drawn is not None:
         tranche.screening_amount_m = drawn
+        tranche.screening_amount_currency = tranche.tranche_drawn_amount.currency
         tranche.screening_amount_basis = "TRANCHE_DRAWN_AMOUNT"
     elif limit is not None:
         tranche.screening_amount_m = limit
+        tranche.screening_amount_currency = tranche.tranche_limit.currency
         tranche.screening_amount_basis = "TRANCHE_LIMIT"
     elif agreement and any(money(value) is not None for value in (
         agreement.agreement_facility_limit, agreement.agreement_drawn_amount,
     )):
         tranche.screening_amount_m = None
+        tranche.screening_amount_currency = None
         tranche.screening_amount_basis = "AGREEMENT_AMOUNT_UNALLOCATED"
         tranche.amount_allocation_status = "AGREEMENT_LEVEL_ONLY"
     else:
         tranche.screening_amount_m = None
+        tranche.screening_amount_currency = None
         tranche.screening_amount_basis = "UNAVAILABLE"
     amount_count = sum(value is not None for value in (drawn, limit, money(tranche.tranche_undrawn_amount)))
     if tranche.amount_allocation_status == "UNAVAILABLE":
@@ -509,31 +543,83 @@ def derive_tranche_screening(
     return tranche
 
 
-def split_multi_tenor_tranches(agreement: DebtAgreement) -> list[DebtTranche]:
+def _without_comparatives(text: str) -> str:
+    """Remove clearly labelled comparative fragments before structural parsing."""
+    text = re.sub(r"\(\s*(?:19|20)\d{2}\s*:[^)]*\)", " ", text, flags=re.I)
+    text = re.sub(r"(?:prior|previous)\s+year|comparative|corresponding\s+period", " ", text, flags=re.I)
+    return re.sub(r"(?:19|20)\d{2}\s*:\s*[^.;\n]+", " ", text)
+
+
+def named_tenors(text: str) -> list[dict]:
+    """Return unambiguous current-period name/tenor pairs from complete page text."""
+    cleaned = _without_comparatives(text)
+    number = r"(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    tenor = rf"{number}\s*(?:-\s*)?years?(?:\s*,?\s*{number}\s*months?)?|{number}\s*months?"
+    name = r"(?:Facility|Tranche|Series|Bond|Note|Class)\s+[A-Z0-9][A-Z0-9._-]*"
+    matches: list[tuple[int, str, str, str]] = []
+    patterns = (
+        re.compile(rf"(?P<tenor>{tenor})\s*\(\s*(?P<name>{name})\s*\)", re.I),
+        re.compile(rf"(?P<name>{name})\s*[:\-]\s*(?P<tenor>{tenor})", re.I),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(cleaned):
+            matches.append((match.start(), match.group("name").strip(), match.group("tenor").strip(), match.group(0)))
+    unique = {}
+    for _, item_name, tenor_text, evidence in sorted(matches):
+        months = parse_tenor_months(tenor_text)
+        if months:
+            unique[item_name.upper()] = {
+                "name": item_name, "tenor_text": tenor_text, "tenor_months": months, "evidence": evidence,
+            }
+    return list(unique.values())
+
+
+def split_multi_tenor_tranches(
+    agreement: DebtAgreement, raw_page_text: str = "", allow_create: bool = True,
+) -> list[DebtTranche]:
     """Split a collapsed record only when evidence names each tenor/tranche pair."""
     if len(agreement.tranches) != 1:
         return agreement.tranches
     original = agreement.tranches[0]
-    evidence = original.source_quote_or_evidence or ""
-    pattern = re.compile(
-        r"((?:(?:\d+(?:\.\d+)?|[A-Za-z]+)\s+YEARS?)(?:\s*,?\s*(?:\d+|[A-Za-z]+)\s+MONTHS?)?)\s*\(([^)]+)\)",
-        re.IGNORECASE,
+    pairs = named_tenors(raw_page_text or original.source_quote_or_evidence or "")
+    pair_names = {pair["name"].upper() for pair in pairs}
+    linked = original.tranche_name.upper() in pair_names or any(
+        name in (original.source_quote_or_evidence or "").upper() for name in pair_names
     )
-    pairs = pattern.findall(evidence)
-    if len(pairs) < 2:
+    if len(pairs) < 2 or not linked or not allow_create:
         return agreement.tranches
     result = []
-    for tenor_text, tranche_name in pairs:
+    for pair in pairs:
         tranche = original.model_copy(deep=True)
-        tranche.tranche_name = tranche_name.strip()
-        tranche.tenor_description = tenor_text.strip()
-        tranche.tenor_months = parse_tenor_months(tenor_text)
+        tranche.tranche_name = pair["name"]
+        tranche.tenor_description = pair["tenor_text"]
+        tranche.tenor_months = pair["tenor_months"]
+        tranche.tenor_basis = "DISCLOSED_REMAINING_TENOR"
+        tranche.source_quote_or_evidence = pair["evidence"]
+        tranche.tranche_limit = tranche.tranche_drawn_amount = tranche.tranche_undrawn_amount = None
         tranche.screening_amount_m = None
+        tranche.screening_amount_currency = None
+        tranche.screening_amount_basis = "AGREEMENT_AMOUNT_UNALLOCATED"
+        tranche.amount_allocation_status = "AGREEMENT_LEVEL_ONLY"
         result.append(tranche)
     return result
 
 
-def postprocess_agreements(payload: ExtractionPayload) -> None:
+def _safeguard_agreement_amounts(agreement: DebtAgreement, tranche: DebtTranche) -> None:
+    """Do not mistake a repeated group/parent amount for a supported child allocation."""
+    evidence = (tranche.source_quote_or_evidence or "").lower()
+    name = tranche.tranche_name.lower()
+    parent_values = {money(agreement.agreement_facility_limit), money(agreement.agreement_drawn_amount)} - {None}
+    child_values = (tranche.tranche_limit, tranche.tranche_drawn_amount, tranche.tranche_undrawn_amount)
+    repeated = any(money(value) in parent_values for value in child_values if value is not None)
+    explicitly_named = name in evidence and bool(re.search(r"\b(?:limit|drawn|balance|amount|facility)\b", evidence))
+    group_wording = bool(re.search(r"\b(?:total|combined|facilities|group|borrowings)\b", evidence))
+    if repeated and (not explicitly_named or group_wording):
+        tranche.tranche_limit = tranche.tranche_drawn_amount = tranche.tranche_undrawn_amount = None
+        tranche.amount_allocation_status = "AGREEMENT_LEVEL_ONLY"
+
+
+def postprocess_agreements(payload: ExtractionPayload, raw_page_text: str = "", allow_split: bool = True) -> None:
     current = []
     for agreement in payload.debt_agreements:
         if not agreement.is_current_period:
@@ -548,9 +634,10 @@ def postprocess_agreements(payload: ExtractionPayload) -> None:
                 source_page=limit.source_page or drawn.source_page,
                 source_quote_or_evidence="Derived as disclosed agreement limit less disclosed agreement drawn amount.",
             )
-        agreement.tranches = split_multi_tenor_tranches(agreement)
+        agreement.tranches = split_multi_tenor_tranches(agreement, raw_page_text, allow_split)
         for tranche in agreement.tranches:
             tranche.parent_agreement_id = agreement.agreement_id
+            _safeguard_agreement_amounts(agreement, tranche)
         agreement.tranches = [
             derive_tranche_screening(tranche, payload.balance_date, agreement)
             for tranche in agreement.tranches
@@ -559,10 +646,15 @@ def postprocess_agreements(payload: ExtractionPayload) -> None:
     payload.debt_agreements = current
 
 
-def agreement_structure_flags(payload: ExtractionPayload) -> list[str]:
+def agreement_structure_flags(payload: ExtractionPayload, raw_page_text: str = "") -> list[str]:
     flags: list[str] = []
     ids: dict[str, DebtAgreement] = {}
     for agreement in payload.debt_agreements:
+        raw_pairs = named_tenors(raw_page_text)
+        returned = {tranche.tranche_name.upper() for tranche in agreement.tranches}
+        linked = bool(returned & {pair["name"].upper() for pair in raw_pairs})
+        if linked and len(raw_pairs) > 1 and any(pair["name"].upper() not in returned for pair in raw_pairs):
+            flags.extend(("MULTIPLE_TENORS_NOT_SPLIT", "MULTIPLE_TRANCHES_COLLAPSED"))
         if not agreement.tranches and agreement.committed_or_uncommitted != "UNCOMMITTED":
             flags.append("MULTIPLE_TRANCHES_COLLAPSED")
         previous = ids.get(agreement.agreement_id)
@@ -605,31 +697,44 @@ def select_relevant_pages(pdf_path: Path, maximum: int = 16) -> tuple[list[int],
 def extract_with_openai(
     ticker: str, company_name: str, matched_legal_entity: str | None,
     filename_financial_year: str | None, source_pages: list[int], page_texts: list[str],
-    model: str, api_key: str,
+    model: str, api_key: str, corrective_feedback: str | None = None,
 ) -> tuple[ExtractionPayload, dict]:
+    from openai import OpenAI
+
     client = OpenAI(api_key=api_key)
     page_content = "\n\n".join(
         f"--- PDF SOURCE PAGE {page} ---\n{text}" for page, text in zip(source_pages, page_texts)
     )
-    completion = client.beta.chat.completions.parse(
+    response = client.responses.parse(
         model=model,
-        messages=[
+        input=[
             {"role": "system", "content": EXTRACTION_PROMPT},
             {"role": "user", "content": (
                 f"Ticker: {ticker}\nCompany: {company_name}\nMatched legal entity: {matched_legal_entity or ''}\n"
-                f"Filename financial year (supporting only): {filename_financial_year or ''}\n\n{page_content}"
+                f"Filename financial year (supporting only): {filename_financial_year or ''}\n"
+                f"Corrective validation feedback: {corrective_feedback or 'None'}\n\n{page_content}"
             )},
         ],
-        response_format=ExtractionPayload,
+        text_format=ExtractionPayload,
     )
-    parsed = completion.choices[0].message.parsed
+    parsed = response.output_parsed
     if parsed is None:
         raise ValueError("Model returned no parsed extraction")
-    usage = completion.usage
+    usage = response.usage
+    details = getattr(usage, "input_tokens_details", None)
     return parsed, {
-        "input_tokens": getattr(usage, "prompt_tokens", None),
-        "output_tokens": getattr(usage, "completion_tokens", None),
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "cached_input_tokens": getattr(details, "cached_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", None),
+        "model": model,
     }
+
+
+def estimated_api_cost(model: str, input_tokens: int = 0, cached_tokens: int = 0, output_tokens: int = 0) -> float:
+    """Usage-based estimate; actual billing may differ."""
+    price = MODEL_PRICING_USD_PER_MILLION.get(model, MODEL_PRICING_USD_PER_MILLION[DEFAULT_RETRY_MODEL])
+    noncached = max(0, input_tokens - cached_tokens)
+    return round((noncached * price["input"] + cached_tokens * price["cached_input"] + output_tokens * price["output"]) / 1_000_000, 6)
 
 
 def validate_extraction(payload: ExtractionPayload, filename_year: str | None) -> list[str]:
@@ -682,6 +787,10 @@ def validate_extraction(payload: ExtractionPayload, filename_year: str | None) -
                 flags.append("TENOR_WITHOUT_REFERENCE_DATE")
             if tranche.exact_maturity_date and tranche.maturity_reference_date == tranche.exact_maturity_date:
                 flags.append("REFERENCE_DATE_USED_AS_MATURITY")
+            disclosed_month = direct_maturity_month(tranche.maturity_description or "")
+            reference_date = parse_date(tranche.maturity_reference_date)
+            if disclosed_month and reference_date and (disclosed_month.year, disclosed_month.month) == (reference_date.year, reference_date.month):
+                flags.append("REFERENCE_DATE_USED_AS_MATURITY")
     for bucket in payload.disclosure_buckets:
         money_objects.append(bucket.amount)
         monetary_values.append(money(bucket.amount))
@@ -725,10 +834,14 @@ def maturity_grid(payload: ExtractionPayload) -> tuple[dict[str, float | None], 
     inferred = {half: None for half in HALVES}
     facility_allocation_found = False
     exact_found = False
+    balance_date = parse_date(payload.balance_date)
     for agreement in payload.debt_agreements:
         if agreement.committed_or_uncommitted == "UNCOMMITTED":
             continue
         for tranche in agreement.tranches:
+            screening_date = parse_date(tranche.screening_maturity_date)
+            if screening_date and balance_date and screening_date < balance_date:
+                continue
             amount = tranche.screening_amount_m
             allocation = allocate_exact(amount, tranche.screening_maturity_date)
             for half, value in allocation.items():
@@ -786,6 +899,8 @@ def append_result(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def document_fingerprint(selected_pdf: str) -> dict:
@@ -811,11 +926,13 @@ def build_record(
 
 def nearest_screening_maturity(extraction: dict) -> dict:
     dated = []
+    balance_date = parse_date(extraction.get("balance_date"))
     for agreement in extraction.get("debt_agreements", []):
         if agreement.get("committed_or_uncommitted") == "UNCOMMITTED":
             continue
         for tranche in agreement.get("tranches", []):
-            if parse_date(tranche.get("screening_maturity_date")):
+            maturity = parse_date(tranche.get("screening_maturity_date"))
+            if maturity and (not balance_date or maturity >= balance_date):
                 dated.append((agreement, tranche))
     if not dated:
         return {}
@@ -911,9 +1028,12 @@ FACILITY_HEADERS = [
     "exact_maturity_date", "derived_maturity_date", "assumed_earliest_maturity_date",
     "screening_maturity_date", "screening_maturity_is_assumed",
     "maturity_assumption_basis", "maturity_assumption_explanation",
-    "agreement_facility_limit_m", "agreement_drawn_amount_m", "agreement_undrawn_amount_m",
-    "tranche_limit_m", "tranche_drawn_amount_m", "tranche_undrawn_amount_m",
-    "screening_amount_m", "screening_amount_basis", "amount_allocation_status",
+    "agreement_facility_limit_m", "agreement_facility_limit_currency",
+    "agreement_drawn_amount_m", "agreement_drawn_amount_currency",
+    "agreement_undrawn_amount_m", "agreement_undrawn_amount_currency",
+    "tranche_limit_m", "tranche_limit_currency", "tranche_drawn_amount_m", "tranche_drawn_amount_currency",
+    "tranche_undrawn_amount_m", "tranche_undrawn_amount_currency",
+    "screening_amount_m", "screening_amount_currency", "screening_amount_basis", "amount_allocation_status",
     "source_page", "source_quote_or_evidence", "confidence", "selected_pdf",
 ]
 BUCKET_HEADERS = [
@@ -927,7 +1047,8 @@ EXCEPTION_HEADERS = [
 RUN_LOG_HEADERS = [
     "ticker", "selected_pdf", "start_time", "finish_time", "elapsed_seconds",
     "extraction_status", "retry_count", "model_used", "source_pages",
-    "error_message", "input_tokens", "output_tokens",
+    "error_message", "input_tokens", "cached_input_tokens", "output_tokens",
+    "estimated_api_cost_usd", "cumulative_estimated_api_cost_usd", "attempts",
 ]
 
 
@@ -955,6 +1076,7 @@ def detail_rows(records: list[dict]) -> tuple[list[dict], list[dict]]:
             for field in ("agreement_facility_limit", "agreement_drawn_amount", "agreement_undrawn_amount"):
                 value = agreement.get(field)
                 agreement_context[f"{field}_m"] = value.get("value_m") if value else None
+                agreement_context[f"{field}_currency"] = value.get("currency") if value else None
             tranches = agreement.get("tranches", [])
             if not tranches:
                 facilities.append({
@@ -972,6 +1094,7 @@ def detail_rows(records: list[dict]) -> tuple[list[dict], list[dict]]:
                 for field in ("tranche_limit", "tranche_drawn_amount", "tranche_undrawn_amount"):
                     value = row.pop(field, None)
                     row[f"{field}_m"] = value.get("value_m") if value else None
+                    row[f"{field}_currency"] = value.get("currency") if value else None
                 facilities.append(row)
         for item in extraction.get("disclosure_buckets", []):
             row = {"company_name": record["target_name"], "selected_pdf": record["document_match"].get("selected_pdf"), **item}
@@ -1031,10 +1154,22 @@ def workbook(path: Path, records: list[dict], register: list[dict]) -> None:
             inferred_fill = PatternFill("solid", fgColor="D9D9D9")
             for column, header in enumerate(headers, 1):
                 if header.endswith(" inferred"):
-                    for cell in sheet.iter_cols(min_col=column, max_col=column, min_row=2):
-                        cell[0].fill = inferred_fill
+                    for cells in sheet.iter_cols(min_col=column, max_col=column, min_row=2, max_row=sheet.max_row):
+                        for cell in cells:
+                            cell.fill = inferred_fill
     path.parent.mkdir(parents=True, exist_ok=True)
     book.save(path)
+
+
+def checkpoint_workbook(path: Path, records: list[dict], register: list[dict]) -> None:
+    """Build beside the last valid workbook, then atomically replace it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.{os.getpid()}.tmp.xlsx")
+    try:
+        workbook(temporary, records, register)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def run_local(args: argparse.Namespace, extractor: Callable = extract_with_openai) -> int:
@@ -1061,8 +1196,12 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
     candidates, register = match_targets(targets, indexed)
     write_csv(output_dir / "document_match_candidates.csv", candidates)
     write_csv(output_dir / "document_register.csv", register)
+    results_path = output_dir / "results.jsonl"
+    latest = load_results(results_path)
+    initial_records = [latest[item["ticker"]] for item in register if item["ticker"] in latest]
+    checkpoint_workbook(output_path, initial_records, register)
     if args.match_only:
-        print(f"Local matching complete: {output_dir / 'document_register.csv'}")
+        print(f"Local matching complete: {output_dir / 'document_register.csv'} (workbook checkpoint saved)")
         return 0
     if args.tickers:
         not_high = [item["ticker"] for item in register if item["match_status"] != "MATCHED_HIGH"]
@@ -1078,15 +1217,21 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
     if accepted and not api_key:
         print("OPENAI_API_KEY is required after matching when accepted PDFs need extraction.", file=sys.stderr)
         return 2
-    results_path = output_dir / "results.jsonl"
-    latest = load_results(results_path)
-    for item in register:
+    cumulative_cost = 0.0
+    total_targets = len(register)
+    for item_number, item in enumerate(register, 1):
+        if args.max_api_cost_usd is not None and item["match_status"] in ACCEPTED:
+            if args.max_api_cost_usd - cumulative_cost < CONSERVATIVE_ISSUER_RESERVE_USD:
+                print(f"API budget estimate stop before {item['ticker']}; partial workbook preserved.")
+                break
         if item["match_status"] not in ACCEPTED:
             record = build_record(item, None, item["match_status"], [], {}, None, {
                 "ticker": item["ticker"], "selected_pdf": "", "extraction_status": item["match_status"],
             }, item["match_reason"])
             append_result(results_path, record)
             latest[item["ticker"]] = record
+            checkpoint_workbook(output_path, [latest[x["ticker"]] for x in register if x["ticker"] in latest], register)
+            print(f"[{item_number}/{total_targets}] {item['ticker']} {item['match_status']} — workbook checkpoint saved")
             continue
         selected = Path(item["selected_pdf"]).resolve(strict=True)
         if not selected.is_relative_to(pdf_root):
@@ -1099,12 +1244,15 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
             and previous.get("document_fingerprint") == fingerprint
             and previous.get("extraction_schema_version") == EXTRACTION_SCHEMA_VERSION
         ):
+            checkpoint_workbook(output_path, [latest[x["ticker"]] for x in register if x["ticker"] in latest], register)
+            print(f"[{item_number}/{total_targets}] {item['ticker']} RESUMED — workbook checkpoint saved")
             continue
         started = datetime.now(timezone.utc)
         monotonic_start = time.monotonic()
         retries = 0
         payload = None
         usage: dict = {}
+        attempts: list[dict] = []
         error = ""
         source_pages: list[int] = []
         try:
@@ -1114,16 +1262,26 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
             for attempt in range(3):
                 retries = attempt
                 try:
+                    attempt_model = args.model if attempt == 0 else args.retry_model
+                    feedback = error or None
                     candidate, candidate_usage = extractor(
                         item["ticker"], item["target_name"], item.get("matched_legal_entity"),
-                        item.get("financial_year"), source_pages, page_texts, args.model, api_key,
+                        item.get("financial_year"), source_pages, page_texts, attempt_model, api_key, feedback,
                     )
-                    payload, usage = candidate, candidate_usage
-                    postprocess_agreements(payload)
+                    attempt_usage = dict(candidate_usage or {})
+                    attempt_usage["model"] = attempt_model
+                    attempt_usage["estimated_cost_usd"] = estimated_api_cost(
+                        attempt_model, attempt_usage.get("input_tokens") or 0,
+                        attempt_usage.get("cached_input_tokens") or 0, attempt_usage.get("output_tokens") or 0,
+                    )
+                    attempts.append(attempt_usage)
+                    payload, usage = candidate, attempt_usage
+                    raw_text = "\n\n".join(page_texts)
+                    postprocess_agreements(payload, raw_text, allow_split=attempt == 2)
                     if payload.extraction_confidence < 0.60 and attempt < 2:
                         error = "Extraction confidence below 0.60; retrying"
                         continue
-                    structural = agreement_structure_flags(payload)
+                    structural = agreement_structure_flags(payload, raw_text)
                     if structural and attempt < 2:
                         error = f"Agreement/tranche structure requires retry: {' | '.join(structural)}"
                         continue
@@ -1134,7 +1292,7 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
                         raise
             if payload:
                 payload.source_pages = sorted(set(payload.source_pages) | set(source_pages))
-                payload.model_used = args.model
+                payload.model_used = attempts[-1]["model"]
                 flags = validate_extraction(payload, item.get("financial_year"))
                 grid, quality = maturity_grid(payload)
                 status = "EXTRACTED_WITH_FLAGS" if flags else "EXTRACTED"
@@ -1144,19 +1302,28 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
             error = error or f"{type(exc).__name__}: {exc}"
             flags, grid, quality, status = [], {}, None, "EXTRACTION_FAILED"
         finished = datetime.now(timezone.utc)
+        attempt_cost = sum(item.get("estimated_cost_usd", 0) for item in attempts)
+        cumulative_cost += attempt_cost
         run_log = {
             "ticker": item["ticker"], "selected_pdf": str(selected),
             "start_time": started.isoformat(), "finish_time": finished.isoformat(),
             "elapsed_seconds": round(time.monotonic() - monotonic_start, 3),
             "extraction_status": status, "retry_count": retries,
-            "model_used": args.model, "source_pages": ", ".join(map(str, source_pages)),
-            "error_message": error, **usage,
+            "model_used": payload.model_used if payload else (attempts[-1]["model"] if attempts else args.model),
+            "source_pages": ", ".join(map(str, source_pages)), "error_message": error,
+            "input_tokens": sum(x.get("input_tokens") or 0 for x in attempts),
+            "cached_input_tokens": sum(x.get("cached_input_tokens") or 0 for x in attempts),
+            "output_tokens": sum(x.get("output_tokens") or 0 for x in attempts),
+            "estimated_api_cost_usd": attempt_cost, "cumulative_estimated_api_cost_usd": cumulative_cost,
+            "attempts": json.dumps(attempts),
         }
         record = build_record(item, payload, status, flags, grid, quality, run_log, error)
         append_result(results_path, record)
         latest[item["ticker"]] = record
+        checkpoint_workbook(output_path, [latest[x["ticker"]] for x in register if x["ticker"] in latest], register)
+        print(f"[{item_number}/{total_targets}] {item['ticker']} {status} — workbook checkpoint saved")
     records = [latest[item["ticker"]] for item in register if item["ticker"] in latest]
-    workbook(output_path, records, register)
+    checkpoint_workbook(output_path, records, register)
     print(f"Workbook: {output_path}")
     return 0
 

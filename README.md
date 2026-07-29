@@ -61,3 +61,15 @@ Remove-Item Env:OPENAI_API_KEY
 Review agreement/tranche separation, amount allocation, exact versus inferred
 dates, committed capacity, comparatives, reconciliations, evidence, and flags
 before expanding beyond this cohort.
+
+The default first-attempt model is `gpt-5.6-luna`; corrective retries use
+`gpt-5.6-terra` and are limited to two after the initial attempt. For a full run
+with a usage-based safety estimate:
+
+```powershell
+python -m src.asx_maturity_screen --force --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen.xlsx" --model gpt-5.6-luna --retry-model gpt-5.6-terra --max-api-cost-usd 20
+```
+
+The cost cap is an estimate from returned token usage, not a guarantee of the
+final invoice. The workbook is created before the first API request and
+atomically checkpointed after every issuer status.
