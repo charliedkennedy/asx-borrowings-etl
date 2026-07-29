@@ -2,6 +2,7 @@ import csv
 from pathlib import Path
 
 import fitz
+import pytest
 
 from src.local_pdf_index import (
     INDEX_FIELDS,
@@ -13,6 +14,18 @@ from src.local_pdf_index import (
     parse_filename,
     parse_report_filename,
 )
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("Preliminary_Final_Report", "PRELIMINARY_FINAL_REPORT"),
+    ("FY2025_Financial_Report", "FINANCIAL_REPORT"),
+    ("CSL_Statutory_Accounts_for_FY2025", "STATUTORY_ACCOUNTS"),
+    ("Statutory_Financial_Statements", "STATUTORY_ACCOUNTS"),
+    ("FY25_Financial_and_Statutory_Report_and_Appendix_4E", "APPENDIX_4E"),
+    ("Full_Year_Results_-_Financial_Year_Ended_30_June_2025", "FULL_YEAR_RESULTS_FINANCIALS"),
+])
+def test_generic_full_year_classification(title, expected):
+    assert classify_report_type(title) == expected
 
 
 def _pdf(path: Path, text: str) -> None:
@@ -101,6 +114,16 @@ def test_exact_ticker_survives_missing_optional_metadata() -> None:
     )
     assert register[0]["selected_filename"] == exact["filename"]
     assert register[0]["match_status"] == "MATCHED_HIGH"
+
+
+def test_preliminary_final_exact_prefix_is_eligible_full_year_document() -> None:
+    row = _indexed(
+        "KMD_2025-09-24_Preliminary_Final_Report.pdf",
+        "KMD Brands Limited Preliminary Final Report Consolidated financial statements Notes to the financial statements",
+    )
+    _, register = match_targets([_target("KMD", "KMD Brands Limited")], [row])
+    assert register[0]["match_status"] == "MATCHED_HIGH"
+    assert register[0]["selected_filename"] == row["filename"]
 
 
 def test_actual_filename_population() -> None:

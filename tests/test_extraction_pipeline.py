@@ -84,6 +84,7 @@ def _bucket() -> DisclosureBucket:
         ticker="IDX", bucket_label="1 to 2 years", period_start="2027-07-01",
         period_end="2027-12-31", amount=_money(12), currency="AUD", source_page=1,
         source_quote_or_evidence="1 to 2 years: $12m", confidence=0.8,
+        amount_type="CARRYING_AMOUNT", safe_for_summary=True,
     )
 
 
@@ -119,13 +120,13 @@ def test_units_leases_exact_bucket_and_split_profiles() -> None:
     exact, quality = maturity_grid(_payload(facilities=[_facility()], buckets=[_bucket()]))
     assert exact["2H27 exact"] == 100
     assert exact["2H27 inferred"] is None
-    assert quality == "FACILITY_DATED"
+    assert quality == "MIXED_DATED_AND_BUCKETED"
     inferred, quality = maturity_grid(_payload(buckets=[_bucket()]))
     assert inferred["2H27 inferred"] == 12
-    assert quality == "BUCKET_INFERRED"
+    assert quality == "BUCKET_ONLY"
     split, quality = maturity_grid(_payload())
     assert all(value is None for value in split.values())
-    assert quality == "SPLIT_ONLY"
+    assert quality == "NO_MATURITY_DISCLOSURE"
     record = {
         "ticker": "IDX", "target_name": "Integral Diagnostics",
         "document_match": {"match_status": "MATCHED_HIGH", "match_confidence": 100,
@@ -183,7 +184,7 @@ def test_resumability_force_ticker_and_workbook(monkeypatch, tmp_path: Path, cap
     book = load_workbook(output)
     assert book.sheetnames == [
         "Summary", "Facilities & Instruments", "Disclosure Buckets",
-        "Document Register", "Exceptions", "Run Log",
+        "Document Register", "Exceptions", "Run Log", "Review Queue",
     ]
     headers = [cell.value for cell in book["Summary"][1]]
     for required in ("Gross debt ex leases", "2H27 exact", "2H27 inferred", "2H27 total", "Source pages"):
@@ -233,3 +234,32 @@ def test_ambiguous_and_failed_extractions_are_safe(monkeypatch, tmp_path: Path) 
     latest = json.loads((output.parent / "results.jsonl").read_text().splitlines()[-1])
     assert latest["status"] == "EXTRACTION_FAILED"
     assert latest["extraction"] is None
+
+
+def test_corrective_timeout_retains_prior_schema_valid_payload(monkeypatch, tmp_path: Path) -> None:
+    root, targets, output = _inputs(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
+    calls = 0
+
+    class APITimeoutError(Exception):
+        pass
+
+    def extractor(ticker, *args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = _payload(ticker=ticker, facilities=[_facility()])
+            result.extraction_confidence = .59
+            return result, {"input_tokens": 10, "output_tokens": 5}
+        raise APITimeoutError("corrective retry timed out")
+
+    assert main_for_args([
+        "--force", "--ticker", "IDX", "--pdf-root", str(root), "--targets", str(targets),
+        "--output", str(output), "--request-timeout-seconds", "1",
+    ], extractor=extractor) == 0
+    latest = json.loads((output.parent / "results.jsonl").read_text().splitlines()[-1])
+    assert latest["status"] == "EXTRACTED_WITH_FLAGS"
+    assert latest["extraction"] is not None
+    assert "RETRY_TIMEOUT" in latest["validation_flags"]
+    assert latest["run_log"]["model_used"] == "gpt-5.6-luna"
+    assert "TIMEOUT" in latest["run_log"]["attempts"]

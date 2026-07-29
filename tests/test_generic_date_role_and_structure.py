@@ -94,3 +94,4 @@ def test_default_and_corrective_models_are_explicit():
     args = parser().parse_args(["--pdf-root", "/tmp/pdfs", "--targets", "targets.csv"])
     assert args.model == DEFAULT_MODEL == "gpt-5.6-luna"
     assert args.retry_model == DEFAULT_RETRY_MODEL == "gpt-5.6-terra"
+    assert args.request_timeout_seconds == 240.0

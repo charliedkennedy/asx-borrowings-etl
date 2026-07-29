@@ -73,3 +73,20 @@ python -m src.asx_maturity_screen --force --pdf-root "C:\Users\chakennedy\2025 F
 The cost cap is an estimate from returned token usage, not a guarantee of the
 final invoice. The workbook is created before the first API request and
 atomically checkpointed after every issuer status.
+
+Schema version 4 separates the report balance date from the screening date. Use
+`--as-of-date YYYY-MM-DD` for a reproducible screen (otherwise the local run date
+is used) and `--request-timeout-seconds 240` to override the bounded request
+timeout. Results created under earlier schema versions are not resumed. The
+workbook now includes a seventh **Review Queue** sheet and separate funded-debt
+maturity and committed-capacity-expiry grids. Foreign-currency amounts remain in
+detail and are excluded from additive reporting-currency totals unless the report
+directly provides an equivalent; the pipeline never retrieves exchange rates.
+
+`targets.csv` currently contains 289 data rows and 289 normalized unique
+identifiers. The formerly duplicated SGR, RGN, and ACF names are retained as
+aliases on single canonical rows; all identifiers pass the 2–5 character local
+filename-prefix format. The earlier downloader's reported 291-source-row input
+is not stored in this repository, so its 288-identifier count cannot be
+reconstructed beyond noting that it was a different source snapshot; no valid
+current target was removed to force the older count.

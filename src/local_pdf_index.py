@@ -17,7 +17,11 @@ SUFFIXES = {
     "AUSTRALIA", "AUSTRALIAN", "TRUST", "REIT", "FUND", "STAPLED",
     "COMPANY", "CORPORATION", "THE",
 }
-ANNUAL_TYPES = {"ANNUAL_REPORT", "ANNUAL_REPORT_AND_4E"}
+ANNUAL_TYPES = {
+    "ANNUAL_REPORT", "ANNUAL_REPORT_AND_4E", "FINANCIAL_REPORT",
+    "STATUTORY_ACCOUNTS", "PRELIMINARY_FINAL_REPORT", "APPENDIX_4E",
+    "FULL_YEAR_RESULTS_FINANCIALS",
+}
 EXCLUDED_DESCRIPTIONS = (
     "PRESENTATION", "TRANSCRIPT", "SUSTAINABILITY", "CORPORATE GOVERNANCE",
     "NOTICE OF MEETING", "MEDIA RELEASE", "RESULTS PRESENTATION",
@@ -29,7 +33,7 @@ INDEX_FIELDS = [
     "page_count", "first_pages_text", "normalised_filename_company",
     "index_error",
 ]
-INDEX_PARSER_VERSION = "3"
+INDEX_PARSER_VERSION = "4"
 _REPORT_FILENAME = re.compile(
     r"^(?P<ticker>[A-Z0-9]{2,5})_(?P<release_date>\d{4}-\d{2}-\d{2})_(?P<title>.+)$",
     re.IGNORECASE,
@@ -76,6 +80,14 @@ def classify_report_type(description: str) -> str:
         return "OTHER"
     if appendix_4e:
         return "APPENDIX_4E"
+    if "PRELIMINARY FINAL REPORT" in text:
+        return "PRELIMINARY_FINAL_REPORT"
+    if "STATUTORY ACCOUNTS" in text or "STATUTORY FINANCIAL STATEMENTS" in text:
+        return "STATUTORY_ACCOUNTS"
+    if "FINANCIAL AND STATUTORY REPORT" in text or "FINANCIAL REPORT" in text:
+        return "FINANCIAL_REPORT"
+    if "FULL YEAR RESULTS" in text:
+        return "FULL_YEAR_RESULTS_FINANCIALS"
     if "HALF YEAR" in text or "HALF YEARLY" in text or "INTERIM FINANCIAL REPORT" in text:
         return "HALF_YEAR_REPORT"
     if "APPENDIX 4D" in text:
@@ -156,7 +168,8 @@ def _metadata(path: Path) -> dict:
     stat = path.stat()
     try:
         with fitz.open(path) as document:
-            text = "\n".join(page.get_text("text") for page in list(document)[:3])
+            # Front matter and contents commonly extend beyond the first three pages.
+            text = "\n".join(page.get_text("text") for page in list(document)[:8])
             pages = len(document)
         error = ""
     except Exception as exc:
@@ -166,7 +179,7 @@ def _metadata(path: Path) -> dict:
         "index_parser_version": INDEX_PARSER_VERSION,
         "full_path": str(path), "filename": path.name, **parsed,
         "file_size_bytes": stat.st_size, "modified_time": int(stat.st_mtime),
-        "page_count": pages, "first_pages_text": text[:12000],
+        "page_count": pages, "first_pages_text": text[:30000],
         "normalised_filename_company": normalise_name(parsed["filename_company"]),
         "index_error": error,
     }
@@ -216,7 +229,9 @@ def read_targets(path: Path) -> list[dict]:
     grouped: dict[str, dict] = {}
     with path.open(encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
-            ticker = row["ticker"].upper()
+            ticker = row["ticker"].strip().upper()
+            if not re.fullmatch(r"[A-Z0-9]{2,5}", ticker):
+                raise ValueError(f"Malformed target identifier: {row['ticker']!r}")
             grouped.setdefault(ticker, {
                 "ticker": ticker, "target_name": row["target_name"],
                 "aliases": [], "warning": "",
@@ -230,6 +245,17 @@ def read_targets(path: Path) -> list[dict]:
 def _identity_hit(row: dict, aliases: list[str]) -> bool:
     content = normalise_name(row.get("first_pages_text", ""))
     return any(normalise_name(alias) in content for alias in aliases)
+
+
+def _content_supports_full_year_financials(row: dict) -> bool:
+    text = re.sub(r"\s+", " ", row.get("first_pages_text", "").upper())
+    presentation = any(marker in text for marker in ("INVESTOR PRESENTATION", "RESULTS PRESENTATION"))
+    financials = any(marker in text for marker in (
+        "FINANCIAL STATEMENTS", "CONSOLIDATED STATEMENT OF", "DIRECTORS' REPORT",
+        "DIRECTORS REPORT", "INDEPENDENT AUDITOR", "NOTES TO THE FINANCIAL",
+        "STATUTORY ACCOUNTS", "PRELIMINARY FINAL REPORT", "APPENDIX 4E",
+    ))
+    return financials and not (presentation and not financials)
 
 
 def _exact_sort_key(row: dict, identity: bool) -> tuple:
@@ -255,7 +281,9 @@ def match_targets(targets: Iterable[dict], index: list[dict]) -> tuple[list[dict
             for row in exact:
                 identity = _identity_hit(row, aliases)
                 annual = row.get("report_type") in ANNUAL_TYPES
-                excluded = row.get("report_type") == "OTHER"
+                if row.get("report_type") == "FULL_YEAR_RESULTS_FINANCIALS":
+                    annual = _content_supports_full_year_financials(row)
+                excluded = row.get("report_type") == "OTHER" or not annual
                 score = min(100.0, 70 + (20 if annual else 0) + (10 if identity else 0))
                 reason = "exact filename ticker" + ("; identity confirmed" if identity else "; identity not confirmed")
                 if excluded:
@@ -298,7 +326,10 @@ def match_targets(targets: Iterable[dict], index: list[dict]) -> tuple[list[dict
                 "reason": reason,
             })
 
-        annual_exact = [item for item in top if item[3] and item[4].get("report_type") in ANNUAL_TYPES]
+        annual_exact = [
+            item for item in top if item[3] and item[4].get("report_type") in ANNUAL_TYPES
+            and (item[4].get("report_type") != "FULL_YEAR_RESULTS_FINANCIALS" or _content_supports_full_year_financials(item[4]))
+        ]
         if exact and not annual_exact:
             status, selected, confidence, reason = "AMBIGUOUS_MATCH", {}, min(100.0, top[0][0]), "only non-annual or excluded ticker files found"
         elif annual_exact:
@@ -310,6 +341,11 @@ def match_targets(targets: Iterable[dict], index: list[dict]) -> tuple[list[dict
                 status, selected, confidence, reason = "MATCHED_HIGH", best[4], best[0], "exact ticker, annual report, and identity confirmed"
             else:
                 status, selected, confidence, reason = "MATCHED_MEDIUM", best[4], best[0], "exact ticker and annual report; identity not fully confirmed"
+            release = selected.get("release_date")
+            if release:
+                released = date.fromisoformat(release)
+                if (date.today() - released).days > 730:
+                    status, reason = "STALE_LOCAL_DOCUMENT", "best exact-prefix full-year document is more than 24 months old"
         elif not top:
             status, selected, confidence, reason = "NO_LOCAL_DOCUMENT", {}, 0.0, "no credible local filename candidate"
         elif top[0][2] and (len(top) == 1 or top[0][0] - top[1][0] >= 8):
