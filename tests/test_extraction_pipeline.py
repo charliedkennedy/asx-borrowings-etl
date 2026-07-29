@@ -199,6 +199,8 @@ def test_resumability_force_ticker_and_workbook(monkeypatch, tmp_path: Path, cap
     assert book["Summary"].cell(2, selected_column).hyperlink is not None
     records = [json.loads(line) for line in results_path.read_text().splitlines()]
     assert records[-1]["status"] in SUCCESS_STATUSES
+    assert records[-1]["raw_model_extraction"] is not None
+    assert records[-1]["extraction"]["normalization_version"] == 5
     assert records[-1]["extraction"]["lease_liabilities"]["value_m"] == 15
 
 

@@ -25,7 +25,7 @@ from .local_pdf_index import build_index, match_targets, read_targets
 PILOT = ("IDX", "MTS", "EVT", "XRO", "BSL", "CHC", "DMP", "GNC", "S32", "TAH")
 ACCEPTED = {"MATCHED_HIGH", "MATCHED_MEDIUM"}
 SUCCESS_STATUSES = {"EXTRACTED", "EXTRACTED_WITH_FLAGS"}
-EXTRACTION_SCHEMA_VERSION = 4
+EXTRACTION_SCHEMA_VERSION = 5
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_RETRY_MODEL = "gpt-5.6-terra"
 # Usage-based safety estimates only; they are not invoice quotes.
@@ -85,7 +85,8 @@ class MoneyValue(StrictModel):
     amount_role: Literal[
         "FACILITY_LIMIT", "FACILITY_DRAWN", "FACILITY_UNDRAWN", "FACE_VALUE",
         "PRINCIPAL_OUTSTANDING", "CARRYING_AMOUNT", "REPORTING_CURRENCY_EQUIVALENT",
-        "CONTRACTUAL_CASH_FLOW", "UNKNOWN",
+        "CONTRACTUAL_REDEMPTION_AMOUNT", "CONTRACTUAL_CASH_FLOW", "GUARANTEE_UTILISATION",
+        "UNCOMMITTED_CAPACITY", "OPTIONAL_ACCORDION", "UNKNOWN",
     ] = "UNKNOWN"
 
 
@@ -119,15 +120,40 @@ class DebtTranche(StrictModel):
     face_value: MoneyValue | None = None
     principal_outstanding: MoneyValue | None = None
     carrying_amount: MoneyValue | None = None
+    contractual_redemption_amount: MoneyValue | None = None
     shared_limit_group_id: str | None = None
     is_sublimit: bool = False
     sublimit_parent_id: str | None = None
     is_non_additive: bool = False
     economic_limit_counting_row: bool = True
     exposure_type: Literal["FUNDED_DEBT", "FACILITY_CAPACITY", "GUARANTEE_OR_LC", "UNKNOWN"] = "UNKNOWN"
-    instrument_status: Literal["ACTIVE", "REPAID", "CANCELLED", "UNKNOWN"] = "UNKNOWN"
+    instrument_status: Literal[
+        "ACTIVE", "REPAID", "CANCELLED", "REFINANCED_SUPERSEDED",
+        "PAST_DUE_STATUS_UNKNOWN", "HISTORICAL_MATURED", "FUTURE_NOT_YET_EFFECTIVE", "UNKNOWN",
+    ] = "UNKNOWN"
     maturity_period_start: str | None = None
     maturity_period_end: str | None = None
+    tenor_months_min: int | None = None
+    tenor_months_max: int | None = None
+    tenor_is_average: bool = False
+    tenor_is_range: bool = False
+    holder_put_date: str | None = None
+    borrower_call_date: str | None = None
+    mandatory_redemption_date: str | None = None
+    final_contractual_maturity_date: str | None = None
+    screening_date_basis: str | None = None
+    debt_maturity_amount_m: float | None = None
+    debt_maturity_currency: str | None = None
+    debt_maturity_amount_reporting_m: float | None = None
+    debt_maturity_amount_basis: str = "UNAVAILABLE"
+    debt_maturity_aggregation_eligible: bool = False
+    facility_capacity_expiry_amount_m: float | None = None
+    facility_capacity_expiry_reporting_m: float | None = None
+    committed_undrawn_expiry_amount_m: float | None = None
+    committed_undrawn_expiry_reporting_m: float | None = None
+    contingent_expiry_amount_m: float | None = None
+    contingent_expiry_reporting_m: float | None = None
+    uncommitted_capacity_amount_m: float | None = None
     screening_amount_basis: SCREENING_AMOUNT_BASES
     amount_allocation_status: AMOUNT_ALLOCATION_STATUSES
     source_page: int | None
@@ -154,6 +180,7 @@ class DebtAgreement(StrictModel):
     effective_date_basis: str | None
     financial_close_date: str | None
     financial_close_date_basis: str | None
+    amendment_or_extension_date: str | None = None
     agreement_source_page: int | None
     agreement_source_quote_or_evidence: str | None
     confidence: float = Field(ge=0, le=1)
@@ -177,6 +204,22 @@ class DisclosureBucket(StrictModel):
         "CARRYING_AMOUNT", "UNKNOWN",
     ] = "UNKNOWN"
     safe_for_summary: bool = False
+    reference_date: str | None = None
+    includes_interest: bool | None = None
+
+
+class NormalizationAudit(StrictModel):
+    validation_code: str
+    severity: Literal["HIGH", "MEDIUM", "LOW"]
+    agreement_id: str | None = None
+    tranche_name: str | None = None
+    affected_field: str
+    rejected_raw_value: str | None = None
+    normalized_value: str | None = None
+    reason: str
+    source_page: int | None = None
+    evidence: str | None = None
+    summary_aggregation_blocked: bool = False
 
 
 class ExtractionPayload(StrictModel):
@@ -208,12 +251,14 @@ class ExtractionPayload(StrictModel):
         "BUCKET_INFERRED", "SPLIT_ONLY",
     ] | None
     leases_apparently_included: bool
+    normalization_audit: list[NormalizationAudit] = Field(default_factory=list)
+    normalization_version: int | None = None
 
 
 EXTRACTION_PROMPT = """Extract debt and maturity information from selected pages of an Australian statutory report.
 Return only facts supported by the supplied page text. Never guess. All monetary values must be converted to millions using the disclosed reporting unit, retain their currency, source page, and short source evidence. Use null for undisclosed fields. Exclude lease liabilities, derivatives not explicitly reported as borrowings, and trade payables from debt and maturities. Keep lease liabilities separately. Distinguish committed undrawn headroom from facility limits. Determine the balance date and financial year primarily from report contents. Preserve exact facilities separately from broad maturity buckets. Do not double count them. Dates must use YYYY-MM-DD when reliably disclosed. Page labels in the supplied text are the source page numbers.
 One agreement may contain multiple tranches. Create a separate tranche for every different name, series, currency, instrument type, tenor, maturity, amount, lender group, or security ranking. Never combine Facility A and Facility B or multiple bond/private-placement series. Distinguish agreement-level amounts from tranche-level amounts and never allocate agreement totals across tranches without source evidence. Distinguish committed capacity from uncommitted accordions and exclude uncommitted capacity from debt and liquidity totals. Extract only the current reporting period; do not create records from prior-year comparatives.
-Keep reporting, refinancing, effective, commencement, financial-close, maturity-reference, exact maturity, and derived maturity dates separate. A reporting or balance date is not a maturity date. Words such as matures, maturing, due, expires, expiry, and repayable on introduce a direct maturity, never a tenor reference date. A disclosed maturity month must not have an original tenor added to it. Only derive from a tenor when a genuine start/reference date is explicitly disclosed and no direct maturity overrides it. Preserve complete source wording for every agreement and tranche. Put a date in exact_maturity_date only when an exact contractual day is directly disclosed. Extract a remaining-tenor reference date and type where stated. Do not copy maturity information between separate tranches. Use null for unsupported values. Keep facility limit, drawn, undrawn, face value, principal outstanding, carrying amount, reporting-currency equivalent, and contractual cash flow in their distinct roles. Mark guarantees and letters of credit as contingent rather than funded debt. Liquidity-table time ranges are disclosure buckets, not tranches. Identify shared caps and non-additive sublimits. Never infer foreign exchange rates. Deterministic post-processing will derive conservative screening fields."""
+Keep reporting, refinancing, effective, commencement, financial-close, maturity-reference, exact maturity, and derived maturity dates separate. A reporting or balance date is not a maturity date. Words such as matures, maturing, due, expires, expiry, and repayable on introduce a direct maturity, never a tenor reference date. A disclosed maturity month must not have an original tenor added to it. Only derive from a tenor when a genuine start/reference date is explicitly disclosed and no direct maturity overrides it. Preserve complete source wording for every agreement and tranche. Put a date in exact_maturity_date only when an exact contractual day is directly disclosed. Extract a remaining-tenor reference date and type where stated. Do not copy maturity information between separate tranches. Use null for unsupported values. Keep facility limit, drawn, undrawn, face value, principal outstanding, carrying amount, reporting-currency equivalent, and contractual cash flow in their distinct roles. Mark guarantees and letters of credit as contingent rather than funded debt. Liquidity-table time ranges are disclosure buckets, not tranches. Identify shared caps and non-additive sublimits. Keep holder puts, borrower calls, mandatory redemptions and final maturities separate. Preserve contractual redemption amounts separately from principal, face value, carrying amount and cash flows including interest. Never infer foreign exchange rates. Do not populate normalization_audit or normalization_version; deterministic normalization will calculate those fields and all aggregation contributions."""
 
 
 def parser() -> argparse.ArgumentParser:
@@ -700,9 +745,10 @@ def postprocess_agreements(payload: ExtractionPayload, raw_page_text: str = "", 
         limit = agreement.agreement_facility_limit
         drawn = agreement.agreement_drawn_amount
         same_currency = limit and drawn and limit.currency and limit.currency == drawn.currency
+        same_basis = limit and drawn and limit.amount_role in {"FACILITY_LIMIT", "UNKNOWN"} and drawn.amount_role in {"FACILITY_DRAWN", "UNKNOWN"}
         facility_like = not re.search(r"\b(?:BOND|NOTE|USPP|PRIVATE PLACEMENT)\b", agreement.instrument_type or "", re.I)
         compatible_amounts = money(limit) is not None and money(drawn) is not None and money(limit) >= money(drawn)
-        if agreement.agreement_undrawn_amount is None and compatible_amounts and same_currency and facility_like:
+        if agreement.agreement_undrawn_amount is None and compatible_amounts and same_currency and same_basis and facility_like:
             agreement.agreement_undrawn_amount = MoneyValue(
                 value_m=round(money(limit) - money(drawn), 6), currency=(limit.currency or drawn.currency),
                 source_page=limit.source_page or drawn.source_page,
@@ -783,6 +829,7 @@ def postprocess_disclosure_buckets(payload: ExtractionPayload) -> None:
     if not balance:
         return
     for bucket in payload.disclosure_buckets:
+        bucket.reference_date = balance.isoformat()
         label = bucket.bucket_label.upper().replace("–", "-").replace("—", "-")
         start: date | None = None
         end: date | None = None
@@ -792,11 +839,361 @@ def postprocess_disclosure_buckets(payload: ExtractionPayload) -> None:
             start, end = add_months(balance, 12) + timedelta(days=1), add_months(balance, 24)
         elif re.search(r"(?:BETWEEN )?(?:TWO|2) (?:AND|TO|-) (?:FIVE|5) YEARS", label):
             start, end = add_months(balance, 24) + timedelta(days=1), add_months(balance, 60)
+        elif re.search(r"(?:BETWEEN )?(?:ONE|1) (?:AND|TO|-) (?:THREE|3) YEARS", label):
+            start, end = add_months(balance, 12) + timedelta(days=1), add_months(balance, 36)
+        elif re.search(r"(?:BETWEEN )?(?:ONE|1) (?:AND|TO|-) (?:FIVE|5) YEARS", label):
+            start, end = add_months(balance, 12) + timedelta(days=1), add_months(balance, 60)
+        elif re.search(r"(?:GREATER THAN|OVER|MORE THAN) (?:THREE|3) YEARS", label):
+            start, bucket.open_ended = add_months(balance, 36) + timedelta(days=1), True
         elif re.search(r"(?:OVER|MORE THAN) (?:FIVE|5) YEARS", label):
             start, bucket.open_ended = add_months(balance, 60) + timedelta(days=1), True
         if start:
             bucket.period_start = start.isoformat()
             bucket.period_end = end.isoformat() if end else None
+
+
+ISO_CURRENCIES = {"AUD", "USD", "EUR", "GBP", "CHF", "NZD", "THB", "MYR", "CNY", "JPY", "HKD", "SGD", "CAD"}
+BUCKET_LANGUAGE = re.compile(
+    r"\b(?:WITHIN|LESS THAN|ONE YEAR OR LESS|BETWEEN|GREATER THAN|MORE THAN|OVER|UP TO)\b"
+    r".{0,30}\b(?:YEAR|YEARS|MONTH|MONTHS)\b", re.I,
+)
+
+
+def _audit(
+    payload: ExtractionPayload, code: str, field: str, reason: str, *, agreement: DebtAgreement | None = None,
+    tranche: DebtTranche | None = None, rejected=None, normalized=None, blocked: bool = True,
+    severity: Literal["HIGH", "MEDIUM", "LOW"] = "HIGH",
+) -> None:
+    payload.validation_flags.append(code)
+    payload.normalization_audit.append(NormalizationAudit(
+        validation_code=code, severity=severity,
+        agreement_id=agreement.agreement_id if agreement else None,
+        tranche_name=tranche.tranche_name if tranche else None,
+        affected_field=field, rejected_raw_value=None if rejected is None else str(rejected),
+        normalized_value=None if normalized is None else str(normalized), reason=reason,
+        source_page=tranche.source_page if tranche else agreement.agreement_source_page if agreement else None,
+        evidence=(tranche.source_quote_or_evidence if tranche else agreement.agreement_source_quote_or_evidence if agreement else None),
+        summary_aggregation_blocked=blocked,
+    ))
+
+
+def _normalize_money_currency(
+    payload: ExtractionPayload, value: MoneyValue | None, field: str,
+    agreement: DebtAgreement | None = None, tranche: DebtTranche | None = None,
+) -> None:
+    if value is None or value.currency is None:
+        return
+    raw = value.currency.strip().upper()
+    if raw in ISO_CURRENCIES:
+        value.currency = raw
+        return
+    if raw in {"$", "A$", "AUD$"} and payload.reporting_currency in ISO_CURRENCIES:
+        value.currency = payload.reporting_currency
+        _audit(payload, "NON_ISO_CURRENCY_NORMALIZED", field,
+               "Unqualified dollar currency normalized to the report presentation currency.",
+               agreement=agreement, tranche=tranche, rejected=raw, normalized=value.currency,
+               blocked=False, severity="LOW")
+    else:
+        value.currency = None
+        _audit(payload, "NON_ISO_CURRENCY_NORMALIZED", field,
+               "Non-ISO or multicurrency label cleared; additive values require a supported currency.",
+               agreement=agreement, tranche=tranche, rejected=raw, normalized=None)
+
+
+def _evidence_has_exact_date(value: date, evidence: str) -> bool:
+    month = next(name.title() for name, number in MONTHS.items() if len(name) > 3 and number == value.month)
+    patterns = (
+        rf"\b{value.day}\s+{month}\s+{value.year}\b",
+        rf"\b{value.day:02d}[/-]{value.month:02d}[/-]{value.year}\b",
+        rf"\b{value.year}-{value.month:02d}-{value.day:02d}\b",
+    )
+    return any(re.search(pattern, evidence, re.I) for pattern in patterns)
+
+
+def _tenor_range(text: str) -> tuple[int | None, int | None, bool]:
+    average = bool(re.search(r"\bAVERAGE (?:TENOR|MATURITY)\b", text, re.I))
+    match = re.search(r"\b(?:BETWEEN\s+)?(\d+(?:\.\d+)?)\s*(?:TO|AND|-)\s*(\d+(?:\.\d+)?)\s*YEARS?\b", text, re.I)
+    if match:
+        return round(float(match.group(1)) * 12), round(float(match.group(2)) * 12), average
+    series = re.search(r"\b(\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?)+(?:\s+AND\s+\d+(?:\.\d+)?)?)\s*YEARS?\b", text, re.I)
+    if series:
+        values = [round(float(item) * 12) for item in re.findall(r"\d+(?:\.\d+)?", series.group(1))]
+        return min(values), max(values), average
+    return None, None, average
+
+
+def normalize_extraction(
+    raw_payload: ExtractionPayload, target_record: dict, selected_page_text: str,
+    as_of_date: date,
+) -> ExtractionPayload:
+    """Quarantine unsupported model values before validation or workbook aggregation."""
+    payload = raw_payload.model_copy(deep=True)
+    payload.company_name = target_record["target_name"]
+    payload.ticker = target_record["ticker"]
+    payload.normalization_audit = []
+    payload.normalization_version = EXTRACTION_SCHEMA_VERSION
+    payload.validation_flags = list(dict.fromkeys(payload.validation_flags))
+    if payload.reporting_currency not in ISO_CURRENCIES:
+        if re.search(r"\b(?:AUD|AUSTRALIAN DOLLARS?)\b", selected_page_text, re.I):
+            payload.reporting_currency = "AUD"
+        else:
+            payload.reporting_currency = None
+    postprocess_agreements(payload, selected_page_text, allow_split=True)
+
+    issuer_money = (
+        "gross_debt_excluding_leases", "current_borrowings_excluding_leases",
+        "non_current_borrowings_excluding_leases", "undrawn_committed_headroom",
+        "cash_and_cash_equivalents", "net_debt_excluding_leases", "lease_liabilities",
+    )
+    for field in issuer_money:
+        _normalize_money_currency(payload, getattr(payload, field), field)
+
+    for agreement in payload.debt_agreements:
+        evidence = " ".join(filter(None, (
+            agreement.agreement_description, agreement.agreement_source_quote_or_evidence,
+        )))
+        for field in ("agreement_facility_limit", "agreement_drawn_amount", "agreement_undrawn_amount"):
+            _normalize_money_currency(payload, getattr(agreement, field), field, agreement=agreement)
+        if agreement.amendment_or_extension_date is None:
+            amendment = re.search(
+                rf"\b(?:EXTENDED|AMENDED)\s+ON\s+(\d{{1,2}}\s+(?:{MONTH_PATTERN})\s+20\d{{2}})\b",
+                evidence, re.I,
+            )
+            parsed_amendment = parse_text_date(amendment.group(1)) if amendment else None
+            agreement.amendment_or_extension_date = parsed_amendment.isoformat() if parsed_amendment else None
+        if agreement.refinancing_date:
+            planned = re.search(r"\b(?:WILL|EXPECTED TO|INTENDS? TO|PLANNED TO)\s+REFINANCE\b", evidence, re.I)
+            completed = re.search(r"\b(?:REFINANC(?:ED|ING (?:WAS )?COMPLETED)|ENTERED INTO|EXECUTED|BECAME EFFECTIVE)\b", evidence, re.I)
+            if planned and not completed:
+                rejected = agreement.refinancing_date
+                agreement.refinancing_date = None
+                _audit(payload, "PLANNED_REFINANCING_NOT_COMPLETED", "refinancing_date",
+                       "Planned refinancing is not a completed transaction date.", agreement=agreement,
+                       rejected=rejected, normalized=None)
+
+        for tranche in agreement.tranches:
+            tranche.ticker = payload.ticker
+            tranche_evidence = " ".join(filter(None, (
+                tranche.tranche_description, tranche.maturity_description,
+                tranche.source_quote_or_evidence, agreement.agreement_source_quote_or_evidence,
+            )))
+            if agreement.refinancing_date and agreement.refinancing_date in {
+                tranche.exact_maturity_date, tranche.screening_maturity_date,
+                tranche.final_contractual_maturity_date,
+            } and re.search(r"\b(?:MATUR|DUE|EXPIR|REPAYABLE)\w*\b", tranche_evidence, re.I):
+                rejected = agreement.refinancing_date
+                agreement.refinancing_date = None
+                _audit(payload, "DATE_ROLE_CONFLICT", "refinancing_date",
+                       "A contractual maturity was incorrectly assigned to refinancing_date.",
+                       agreement=agreement, tranche=tranche, rejected=rejected, normalized=None)
+            for field in (
+                "tranche_limit", "tranche_drawn_amount", "tranche_undrawn_amount", "face_value",
+                "principal_outstanding", "carrying_amount", "contractual_redemption_amount",
+            ):
+                _normalize_money_currency(payload, getattr(tranche, field), field, agreement, tranche)
+
+            if BUCKET_LANGUAGE.search(tranche_evidence) and re.search(
+                r"\b(?:LIQUIDITY|CONTRACTUAL CASH FLOW|UNDISCOUNTED|PRINCIPAL AND INTEREST|CURRENT/NON-CURRENT)\b",
+                tranche_evidence, re.I,
+            ):
+                rejected = tranche.screening_maturity_date or tranche.derived_maturity_date or tranche.tenor_months
+                tranche.tenor_months = tranche.derived_maturity_date = tranche.screening_maturity_date = None
+                tranche.assumed_earliest_maturity_date = tranche.exact_maturity_date = None
+                tranche.screening_amount_m = None
+                tranche.maturity_assumption_basis = "UNDETERMINED"
+                _audit(payload, "BUCKET_INSTRUMENT_ALLOCATION_UNSUPPORTED", "screening_maturity_date",
+                       "Liquidity bucket cannot establish a contractual instrument maturity.",
+                       agreement=agreement, tranche=tranche, rejected=rejected, normalized=None)
+
+            exact = parse_date(tranche.exact_maturity_date)
+            if exact and not _evidence_has_exact_date(exact, tranche_evidence):
+                rejected = tranche.exact_maturity_date
+                tranche.exact_maturity_date = None
+                month = direct_maturity_month(tranche_evidence)
+                tranche.screening_maturity_date = month.isoformat() if month else None
+                tranche.screening_maturity_is_assumed = bool(month)
+                tranche.maturity_assumption_basis = "MONTH_START_ASSUMPTION" if month else "UNDETERMINED"
+                _audit(payload, "EXACT_DATE_EVIDENCE_MISSING", "exact_maturity_date",
+                       "Exact day/month/year is absent from directly associated evidence.",
+                       agreement=agreement, tranche=tranche, rejected=rejected,
+                       normalized=tranche.screening_maturity_date)
+
+            minimum, maximum, average = _tenor_range(tranche_evidence)
+            if minimum is not None and maximum is not None:
+                tranche.tenor_months_min, tranche.tenor_months_max = minimum, maximum
+                tranche.tenor_is_range, tranche.tenor_is_average = minimum != maximum, average
+                tranche.tenor_months = None
+                tranche.derived_maturity_date = tranche.screening_maturity_date = None
+                tranche.assumed_earliest_maturity_date = None
+                tranche.maturity_assumption_basis = "UNDETERMINED"
+            elif average:
+                tranche.tenor_is_average = True
+                tranche.derived_maturity_date = tranche.screening_maturity_date = None
+
+            maturity_range = re.search(
+                rf"\b(?:FROM\s+)?({MONTH_PATTERN})\s+(20\d{{2}})\s+(?:TO|THROUGH|UNTIL|-)\s+"
+                rf"({MONTH_PATTERN})\s+(20\d{{2}})\b", tranche_evidence, re.I,
+            )
+            range_amount_blocked = False
+            if maturity_range:
+                period_start = _month_start(maturity_range.group(1), maturity_range.group(2))
+                period_end_start = _month_start(maturity_range.group(3), maturity_range.group(4))
+                tranche.maturity_period_start = period_start.isoformat()
+                tranche.maturity_period_end = (add_months(period_end_start, 1) - timedelta(days=1)).isoformat()
+                tranche.exact_maturity_date = None
+                tranche.screening_maturity_date = period_start.isoformat()
+                tranche.screening_maturity_is_assumed = True
+                tranche.maturity_assumption_basis = "RANGE_START_MONTH"
+                range_amount_blocked = True
+
+            if tranche.tenor_basis == "DISCLOSED_ORIGINAL_TENOR" and not tranche.maturity_reference_date:
+                tranche.derived_maturity_date = tranche.screening_maturity_date = None
+                tranche.assumed_earliest_maturity_date = None
+
+            if re.search(r"\b(?:WAS|HAS BEEN|FULLY)\s+REPAID\b", tranche_evidence, re.I):
+                tranche.instrument_status = "REPAID"
+            elif re.search(r"\b(?:CANCELLED|TERMINATED)\b", tranche_evidence, re.I):
+                tranche.instrument_status = "CANCELLED"
+            elif re.search(r"\b(?:SUPERSEDED|REPLACED)\b", tranche_evidence, re.I) and re.search(r"\bREFINANC", tranche_evidence, re.I):
+                tranche.instrument_status = "REFINANCED_SUPERSEDED"
+            effective = parse_date(agreement.effective_date)
+            if effective and effective > as_of_date:
+                tranche.instrument_status = "FUTURE_NOT_YET_EFFECTIVE"
+
+            maturity = parse_date(tranche.screening_maturity_date)
+            put_date = parse_date(tranche.holder_put_date)
+            final_date = parse_date(tranche.final_contractual_maturity_date) or maturity
+            if put_date and final_date and put_date < final_date:
+                _audit(payload, "OPTION_DATE_BEFORE_FINAL_MATURITY", "holder_put_date",
+                       "Holder-controlled put date precedes final contractual maturity.",
+                       agreement=agreement, tranche=tranche, rejected=final_date, normalized=put_date,
+                       blocked=False, severity="MEDIUM")
+                if put_date >= as_of_date:
+                    tranche.screening_maturity_date = put_date.isoformat()
+                    tranche.screening_date_basis = "HOLDER_PUT_DATE"
+                    maturity = put_date
+                else:
+                    _audit(payload, "HOLDER_PUT_STATUS_UNKNOWN", "holder_put_date",
+                           "Past holder put date has no disclosed outcome.", agreement=agreement,
+                           tranche=tranche, rejected=put_date, normalized=None)
+            if maturity and maturity < as_of_date and tranche.instrument_status not in {
+                "REPAID", "CANCELLED", "REFINANCED_SUPERSEDED",
+            }:
+                tranche.instrument_status = "PAST_DUE_STATUS_UNKNOWN"
+                _audit(payload, "MATURED_STATUS_UNCONFIRMED", "instrument_status",
+                       "Maturity precedes the screening date and the report does not establish the outcome.",
+                       agreement=agreement, tranche=tranche, rejected="ACTIVE", normalized=tranche.instrument_status)
+            elif tranche.instrument_status == "UNKNOWN" and (not maturity or maturity >= as_of_date):
+                tranche.instrument_status = "ACTIVE"
+
+            # Independent normalized economic contributions.
+            redemption = tranche.contractual_redemption_amount
+            principal = tranche.principal_outstanding
+            drawn = tranche.tranche_drawn_amount
+            face = tranche.face_value
+            fully_drawn_limit = tranche.tranche_limit if re.search(r"\bFULLY (?:DRAWN|UTILI[ZS]ED)\b", tranche_evidence, re.I) else None
+            source = redemption or principal or drawn or face or fully_drawn_limit
+            basis = (
+                "CONTRACTUAL_REDEMPTION_AMOUNT" if redemption else "PRINCIPAL_OUTSTANDING" if principal
+                else "TRANCHE_DRAWN_AMOUNT" if drawn else "FACE_VALUE" if face
+                else "TRANCHE_LIMIT" if fully_drawn_limit else "UNAVAILABLE"
+            )
+            contingent = tranche.exposure_type == "GUARANTEE_OR_LC" or bool(re.search(r"\b(?:GUARANTEE|LETTER OF CREDIT|\bLC\b)\b", tranche_evidence, re.I))
+            inactive = tranche.instrument_status in {
+                "REPAID", "CANCELLED", "REFINANCED_SUPERSEDED", "HISTORICAL_MATURED",
+                "PAST_DUE_STATUS_UNKNOWN", "FUTURE_NOT_YET_EFFECTIVE",
+            }
+            tranche.debt_maturity_amount_m = None if contingent or source is None else source.value_m
+            tranche.debt_maturity_currency = None if source is None else source.currency
+            tranche.debt_maturity_amount_basis = basis
+            tranche.debt_maturity_amount_reporting_m = (
+                tranche.reporting_currency_equivalent_m
+                if tranche.reporting_currency_equivalent_m is not None
+                else tranche.debt_maturity_amount_m if source and source.currency == payload.reporting_currency else None
+            )
+            tranche.debt_maturity_aggregation_eligible = bool(
+                not inactive and not contingent and tranche.debt_maturity_amount_reporting_m is not None
+                and tranche.screening_maturity_date and not range_amount_blocked and not tranche.tenor_is_range
+            )
+            if range_amount_blocked and source:
+                _audit(payload, "BUCKET_INSTRUMENT_ALLOCATION_UNSUPPORTED", "debt_maturity_amount_m",
+                       "An aggregate instrument amount cannot be assigned to one date within a disclosed maturity range.",
+                       agreement=agreement, tranche=tranche, rejected=source.value_m, normalized=None)
+            if contingent and tranche.screening_amount_m:
+                _audit(payload, "CONTINGENT_AMOUNT_USED_AS_DEBT", "debt_maturity_amount_m",
+                       "Guarantee or LC utilisation was removed from funded-debt exposure.",
+                       agreement=agreement, tranche=tranche, rejected=tranche.screening_amount_m, normalized=None)
+            tranche.facility_capacity_expiry_amount_m = (
+                money(tranche.tranche_limit) if agreement.committed_or_uncommitted == "COMMITTED"
+                and tranche.economic_limit_counting_row and not inactive and not contingent else None
+            )
+            tranche.facility_capacity_expiry_reporting_m = (
+                tranche.facility_capacity_expiry_amount_m
+                if tranche.tranche_limit and tranche.tranche_limit.currency == payload.reporting_currency else None
+            )
+            tranche.committed_undrawn_expiry_amount_m = (
+                money(tranche.tranche_undrawn_amount) if agreement.committed_or_uncommitted == "COMMITTED"
+                and not inactive and not contingent else None
+            )
+            tranche.committed_undrawn_expiry_reporting_m = (
+                tranche.committed_undrawn_expiry_amount_m
+                if tranche.tranche_undrawn_amount and tranche.tranche_undrawn_amount.currency == payload.reporting_currency else None
+            )
+            tranche.contingent_expiry_amount_m = (
+                money(tranche.tranche_drawn_amount) or money(tranche.tranche_limit) if contingent and not inactive else None
+            )
+            contingent_source = tranche.tranche_drawn_amount or tranche.tranche_limit
+            tranche.contingent_expiry_reporting_m = (
+                tranche.contingent_expiry_amount_m
+                if contingent_source and contingent_source.currency == payload.reporting_currency else None
+            )
+            tranche.uncommitted_capacity_amount_m = (
+                money(tranche.tranche_limit) if agreement.committed_or_uncommitted == "UNCOMMITTED" else None
+            )
+            if source and source.currency != payload.reporting_currency and tranche.reporting_currency_equivalent_m is None:
+                _audit(payload, "REPORTING_CURRENCY_EQUIVALENT_UNAVAILABLE", "debt_maturity_amount_reporting_m",
+                       "Original-currency amount retained but blocked from reporting-currency aggregation.",
+                       agreement=agreement, tranche=tranche, rejected=source.currency, normalized=None)
+        exposure_kinds = set()
+        for item in agreement.tranches:
+            if item.debt_maturity_amount_m is not None:
+                exposure_kinds.add("FUNDED")
+            if item.contingent_expiry_amount_m is not None:
+                exposure_kinds.add("CONTINGENT")
+            if item.facility_capacity_expiry_amount_m is not None:
+                exposure_kinds.add("CAPACITY")
+        if len(exposure_kinds) > 1:
+            _audit(payload, "MIXED_EXPOSURE_AGREEMENT", "agreement_reconciliation",
+                   "Agreement contains multiple economic exposure categories; reconciliation is category-specific.",
+                   agreement=agreement, blocked=False, severity="MEDIUM")
+            payload.validation_flags.append("AGREEMENT_RECON_BLOCKED_BY_MIXED_EXPOSURE")
+        shared_groups: dict[str, list[DebtTranche]] = {}
+        for item in agreement.tranches:
+            if item.shared_limit_group_id:
+                shared_groups.setdefault(item.shared_limit_group_id, []).append(item)
+        for group_rows in shared_groups.values():
+            counting = [item for item in group_rows if item.economic_limit_counting_row]
+            if len(counting) > 1:
+                controller = next((item for item in counting if not item.is_sublimit), None)
+                if controller:
+                    for item in counting:
+                        if item is not controller:
+                            item.economic_limit_counting_row = False
+                            item.is_non_additive = True
+                            item.facility_capacity_expiry_amount_m = None
+                            item.facility_capacity_expiry_reporting_m = None
+                    _audit(payload, "SHARED_LIMIT_NON_ADDITIVE", "economic_limit_counting_row",
+                           "Only the controlling shared-cap row remains additive.", agreement=agreement,
+                           blocked=False, severity="MEDIUM")
+                else:
+                    for item in counting:
+                        item.economic_limit_counting_row = False
+                        item.facility_capacity_expiry_amount_m = None
+                    _audit(payload, "AMOUNT_SOURCE_CONFLICT", "economic_limit_counting_row",
+                           "No controlling shared-cap row is supported; capacity aggregation was blocked.",
+                           agreement=agreement)
+    payload.validation_flags = list(dict.fromkeys(payload.validation_flags))
+    return payload
 
 
 def agreement_structure_flags(payload: ExtractionPayload, raw_page_text: str = "") -> list[str]:
@@ -901,6 +1298,17 @@ def validate_extraction(
             flags.append("COMBINED_DISCLOSURE_UNALLOCATED")
         if agreement.committed_or_uncommitted != "COMMITTED":
             continue
+        exposure_kinds = set()
+        for item in agreement.tranches:
+            if item.debt_maturity_amount_m is not None:
+                exposure_kinds.add("FUNDED")
+            if item.contingent_expiry_amount_m is not None:
+                exposure_kinds.add("CONTINGENT")
+            if item.facility_capacity_expiry_amount_m is not None:
+                exposure_kinds.add("CAPACITY")
+        if len(exposure_kinds) > 1:
+            flags.append("AGREEMENT_RECON_BLOCKED_BY_MIXED_EXPOSURE")
+            continue
         agreement_drawn = money(agreement.agreement_drawn_amount)
         if agreement_drawn is not None and (
             not payload.reporting_currency or agreement.agreement_drawn_amount.currency in {None, payload.reporting_currency}
@@ -938,8 +1346,12 @@ def validate_extraction(
         if agreement.committed_or_uncommitted == "UNCLEAR":
             flags.append("COMMITTED_UNCOMMITTED_CLASSIFICATION_UNCLEAR")
         for tranche in agreement.tranches:
-            money_objects.extend((tranche.tranche_limit, tranche.tranche_drawn_amount, tranche.tranche_undrawn_amount))
-            monetary_values.extend((money(tranche.tranche_limit), money(tranche.tranche_drawn_amount), money(tranche.tranche_undrawn_amount)))
+            tranche_money = (
+                tranche.tranche_limit, tranche.tranche_drawn_amount, tranche.tranche_undrawn_amount,
+                tranche.face_value, tranche.principal_outstanding, tranche.contractual_redemption_amount,
+            )
+            money_objects.extend(tranche_money)
+            monetary_values.extend(money(value) for value in tranche_money)
             if tranche.amount_allocation_status == "PARTIAL_TRANCHE_ALLOCATION":
                 flags.append("PARTIAL_TRANCHE_ALLOCATION")
             if tranche.screening_maturity_date and tranche.screening_amount_m is None:
@@ -1016,6 +1428,8 @@ def validate_extraction(
 
 
 def _reporting_currency_debt_amount(tranche: DebtTranche, reporting_currency: str | None) -> float | None:
+    if tranche.debt_maturity_aggregation_eligible:
+        return tranche.debt_maturity_amount_reporting_m
     if tranche.exposure_type in {"FACILITY_CAPACITY", "GUARANTEE_OR_LC"}:
         return None
     if tranche.reporting_currency_equivalent_m is not None:
@@ -1034,6 +1448,11 @@ def maturity_grid(payload: ExtractionPayload, as_of_date: date | None = None) ->
     capacity_exact = {half: None for half in HALVES}
     capacity_inferred = {half: None for half in HALVES}
     capacity_found = False
+    undrawn_exact = {half: None for half in HALVES}
+    undrawn_inferred = {half: None for half in HALVES}
+    contingent_exact = {half: None for half in HALVES}
+    contingent_inferred = {half: None for half in HALVES}
+    normalized = payload.normalization_version == EXTRACTION_SCHEMA_VERSION
     balance_date = parse_date(payload.balance_date)
     for agreement in payload.debt_agreements:
         if agreement.committed_or_uncommitted == "UNCOMMITTED":
@@ -1046,6 +1465,8 @@ def maturity_grid(payload: ExtractionPayload, as_of_date: date | None = None) ->
                 continue
             dated_found = dated_found or screening_date is not None
             amount = _reporting_currency_debt_amount(tranche, payload.reporting_currency)
+            if normalized and not tranche.debt_maturity_aggregation_eligible:
+                amount = None
             allocation = allocate_exact(amount, tranche.screening_maturity_date)
             for half, value in allocation.items():
                 if value is not None:
@@ -1054,13 +1475,22 @@ def maturity_grid(payload: ExtractionPayload, as_of_date: date | None = None) ->
                     facility_allocation_found = True
                     exact_found = exact_found or not tranche.screening_maturity_is_assumed
             if agreement.committed_or_uncommitted == "COMMITTED" and tranche.economic_limit_counting_row:
-                capacity_amount = money(tranche.tranche_limit)
+                capacity_amount = tranche.facility_capacity_expiry_reporting_m if normalized else money(tranche.tranche_limit)
                 capacity_allocation = allocate_exact(capacity_amount, tranche.screening_maturity_date)
                 for half, value in capacity_allocation.items():
                     if value is not None:
                         target = capacity_inferred if tranche.screening_maturity_is_assumed else capacity_exact
                         target[half] = (target[half] or 0) + value
                         capacity_found = True
+                for amount_value, exact_target, inferred_target in (
+                    (tranche.committed_undrawn_expiry_reporting_m, undrawn_exact, undrawn_inferred),
+                    (tranche.contingent_expiry_reporting_m, contingent_exact, contingent_inferred),
+                ):
+                    contribution = allocate_exact(amount_value, tranche.screening_maturity_date)
+                    for half, value in contribution.items():
+                        if value is not None:
+                            target = inferred_target if tranche.screening_maturity_is_assumed else exact_target
+                            target[half] = (target[half] or 0) + value
     if facility_allocation_found:
         quality = "MIXED_DATED_AND_BUCKETED" if any(bucket.safe_for_summary for bucket in payload.disclosure_buckets) else "FACILITY_DATED"
     else:
@@ -1091,6 +1521,15 @@ def maturity_grid(payload: ExtractionPayload, as_of_date: date | None = None) ->
         grid[f"{half} capacity total"] = sum(
             value for value in (capacity_exact[half], capacity_inferred[half]) if value is not None
         ) if capacity_exact[half] is not None or capacity_inferred[half] is not None else None
+        for label, exact_values, inferred_values in (
+            ("undrawn", undrawn_exact, undrawn_inferred),
+            ("contingent", contingent_exact, contingent_inferred),
+        ):
+            grid[f"{half} {label} exact"] = exact_values[half]
+            grid[f"{half} {label} inferred"] = inferred_values[half]
+            grid[f"{half} {label} total"] = sum(
+                value for value in (exact_values[half], inferred_values[half]) if value is not None
+            ) if exact_values[half] is not None or inferred_values[half] is not None else None
     return grid, quality
 
 
@@ -1133,7 +1572,7 @@ def document_fingerprint(selected_pdf: str) -> dict:
 def build_record(
     register: dict, payload: ExtractionPayload | None, status: str, flags: list[str],
     grid: dict[str, float | None], profile_quality: str | None, run_log: dict,
-    error: str = "", as_of_date: date | None = None,
+    error: str = "", as_of_date: date | None = None, raw_model_extraction: dict | None = None,
 ) -> dict:
     return {
         "extraction_schema_version": EXTRACTION_SCHEMA_VERSION,
@@ -1141,6 +1580,7 @@ def build_record(
         "document_match": register, "document_fingerprint": document_fingerprint(register["selected_pdf"]) if register.get("selected_pdf") else None,
         "selected_pages": payload.source_pages if payload else [],
         "extraction": payload.model_dump(mode="json") if payload else None,
+        "raw_model_extraction": raw_model_extraction,
         "status": status, "validation_flags": flags, "maturity_grid": grid,
         "profile_quality": profile_quality, "run_log": run_log, "error": error,
         "screening_as_of_date": (as_of_date or date.today()).isoformat(),
@@ -1150,7 +1590,9 @@ def build_record(
 def nearest_screening_maturity(extraction: dict, as_of_date: date | None = None) -> dict:
     debt_dated = []
     capacity_dated = []
+    contingent_dated = []
     cutoff = as_of_date or parse_date(extraction.get("balance_date"))
+    normalized = extraction.get("normalization_version") == EXTRACTION_SCHEMA_VERSION
     for agreement in extraction.get("debt_agreements", []):
         if agreement.get("committed_or_uncommitted") == "UNCOMMITTED":
             continue
@@ -1158,15 +1600,24 @@ def nearest_screening_maturity(extraction: dict, as_of_date: date | None = None)
             maturity = parse_date(tranche.get("screening_maturity_date"))
             if not maturity or (cutoff and maturity < cutoff) or tranche.get("instrument_status") in {"REPAID", "CANCELLED"}:
                 continue
-            if tranche.get("exposure_type") != "GUARANTEE_OR_LC" and (
-                tranche.get("tranche_drawn_amount") or tranche.get("principal_outstanding")
-                or tranche.get("face_value") or agreement.get("agreement_drawn_amount")
+            if tranche.get("instrument_status") in {
+                "REPAID", "CANCELLED", "REFINANCED_SUPERSEDED", "HISTORICAL_MATURED", "PAST_DUE_STATUS_UNKNOWN",
+            }:
+                continue
+            if (normalized and tranche.get("debt_maturity_amount_basis") not in {None, "UNAVAILABLE"}) or (
+                not normalized and tranche.get("exposure_type") != "GUARANTEE_OR_LC" and (
+                    tranche.get("tranche_drawn_amount") or tranche.get("principal_outstanding")
+                    or tranche.get("face_value") or agreement.get("agreement_drawn_amount")
+                )
             ):
                 debt_dated.append((agreement, tranche))
-            if agreement.get("committed_or_uncommitted") == "COMMITTED" and (
-                tranche.get("tranche_limit") or agreement.get("agreement_facility_limit")
+            if (normalized and tranche.get("facility_capacity_expiry_amount_m") is not None) or (
+                not normalized and agreement.get("committed_or_uncommitted") == "COMMITTED"
+                and (tranche.get("tranche_limit") or agreement.get("agreement_facility_limit"))
             ):
                 capacity_dated.append((agreement, tranche))
+            if tranche.get("contingent_expiry_amount_m") is not None:
+                contingent_dated.append((agreement, tranche))
     result: dict = {}
     if debt_dated:
         agreement, nearest = min(debt_dated, key=lambda pair: parse_date(pair[1]["screening_maturity_date"]))
@@ -1196,6 +1647,14 @@ def nearest_screening_maturity(extraction: dict, as_of_date: date | None = None)
             "Facility capacity expiring": (nearest.get("tranche_limit") or agreement.get("agreement_facility_limit") or {}).get("value_m"),
             "Committed undrawn capacity expiring": (nearest.get("tranche_undrawn_amount") or agreement.get("agreement_undrawn_amount") or {}).get("value_m"),
             "Upcoming facility expiry flag": "Y",
+        })
+    if contingent_dated:
+        agreement, nearest = min(contingent_dated, key=lambda pair: parse_date(pair[1]["screening_maturity_date"]))
+        result.update({
+            "Nearest contingent facility expiry": nearest.get("screening_maturity_date"),
+            "Nearest contingent tranche": nearest.get("tranche_name"),
+            "Contingent amount expiring": nearest.get("contingent_expiry_amount_m"),
+            "Upcoming contingent expiry flag": "Y",
         })
     return result
 
@@ -1253,6 +1712,9 @@ def summary_row(record: dict) -> dict:
         "Profile quality": record.get("profile_quality"), "Selected PDF": match.get("selected_pdf"),
         "Source pages": ", ".join(map(str, record.get("selected_pages", []))),
         "Validation flags": " | ".join(record.get("validation_flags", [])),
+        "Summary aggregation blocked": any(
+            audit.get("summary_aggregation_blocked") for audit in extraction.get("normalization_audit", [])
+        ),
         "Extraction notes": extraction.get("extraction_notes") or record.get("error", ""),
         **nearest_screening_maturity(extraction, parse_date(record.get("screening_as_of_date"))),
     }
@@ -1268,8 +1730,10 @@ SUMMARY_HEADERS = [
     "Net debt reconciliation explanation", "Screening as-of date",
 ] + [
     "Nearest upcoming funded-debt maturity", "Nearest upcoming facility expiry",
+    "Nearest contingent facility expiry", "Nearest contingent tranche", "Contingent amount expiring",
     "Nearest facility expiry tranche", "Nearest facility expiry agreement", "Facility capacity expiring",
     "Committed undrawn capacity expiring", "Upcoming debt maturity flag", "Upcoming facility expiry flag",
+    "Upcoming contingent expiry flag",
     "Nearest tranche maturity date", "Nearest tranche name", "Nearest maturity agreement",
     "Nearest maturity assumed", "Nearest maturity basis",
     "Agreement facility limit at nearest maturity", "Agreement drawn amount at nearest maturity",
@@ -1278,8 +1742,10 @@ SUMMARY_HEADERS = [
     "Upcoming maturity confidence",
 ] + [f"{half} {kind}" for half in HALVES for kind in ("exact", "inferred", "total")] + [
 ] + [f"{half} capacity {kind}" for half in HALVES for kind in ("exact", "inferred", "total")] + [
+] + [f"{half} undrawn {kind}" for half in HALVES for kind in ("exact", "inferred", "total")] + [
+] + [f"{half} contingent {kind}" for half in HALVES for kind in ("exact", "inferred", "total")] + [
     "2H27 maturity total", "2H27 maturity flag", "Profile quality", "Selected PDF",
-    "Source pages", "Validation flags", "Extraction notes",
+    "Source pages", "Validation flags", "Summary aggregation blocked", "Extraction notes",
 ]
 FACILITY_HEADERS = [
     "ticker", "company_name", "agreement_id", "agreement_name", "tranche_name",
@@ -1301,25 +1767,34 @@ FACILITY_HEADERS = [
     "tranche_undrawn_amount_m", "tranche_undrawn_amount_currency", "tranche_undrawn_amount_role",
     "face_value_m", "face_value_currency", "face_value_role", "principal_outstanding_m", "principal_outstanding_currency",
     "principal_outstanding_role", "carrying_amount_m", "carrying_amount_currency", "carrying_amount_role", "reporting_currency_equivalent_m",
+    "contractual_redemption_amount_m", "contractual_redemption_amount_currency", "contractual_redemption_amount_role",
     "reporting_currency_equivalent_currency", "shared_limit_group_id", "is_sublimit",
     "sublimit_parent_id", "is_non_additive", "economic_limit_counting_row", "exposure_type",
     "instrument_status", "maturity_period_start", "maturity_period_end",
+    "tenor_months_min", "tenor_months_max", "tenor_is_average", "tenor_is_range",
+    "holder_put_date", "borrower_call_date", "mandatory_redemption_date", "final_contractual_maturity_date",
+    "screening_date_basis", "debt_maturity_amount_m", "debt_maturity_currency",
+    "debt_maturity_amount_reporting_m", "debt_maturity_amount_basis", "debt_maturity_aggregation_eligible",
+    "facility_capacity_expiry_amount_m", "facility_capacity_expiry_reporting_m",
+    "committed_undrawn_expiry_amount_m", "committed_undrawn_expiry_reporting_m",
+    "contingent_expiry_amount_m", "contingent_expiry_reporting_m", "uncommitted_capacity_amount_m",
     "screening_amount_m", "screening_amount_currency", "screening_amount_basis", "amount_allocation_status",
     "source_page", "source_quote_or_evidence", "confidence", "selected_pdf",
 ]
 BUCKET_HEADERS = [
-    "company_name", "selected_pdf", "ticker", "bucket_label", "period_start",
+    "company_name", "selected_pdf", "ticker", "bucket_label", "reference_date", "period_start",
     "period_end", "currency", "source_page", "source_quote_or_evidence",
     "confidence", "amount_m", "amount_source_page",
-    "open_ended", "amount_type", "safe_for_summary",
+    "open_ended", "amount_type", "includes_interest", "safe_for_summary",
 ]
 EXCEPTION_HEADERS = [
     "ticker", "company", "status", "validation_code", "severity", "explanation",
     "affected_row", "aggregation_blocked", "retry_warning", "terminal_error", "selected_pdf",
 ]
 REVIEW_HEADERS = [
-    "ticker", "company", "severity", "validation_code", "affected_agreement_or_tranche",
-    "explanation", "source_page", "summary_aggregation_blocked",
+    "ticker", "company", "agreement_id", "tranche_name", "severity", "validation_code",
+    "affected_normalized_field", "rejected_raw_value", "normalized_value", "reason",
+    "source_page", "evidence", "summary_aggregation_blocked",
 ]
 RUN_LOG_HEADERS = [
     "ticker", "target_name", "selected_pdf", "start_time", "finish_time", "elapsed_seconds",
@@ -1369,7 +1844,7 @@ def detail_rows(records: list[dict]) -> tuple[list[dict], list[dict]]:
                 }
                 row["instrument_type"] = tranche.get("tranche_instrument_type") or agreement.get("instrument_type")
                 row["currency"] = tranche.get("tranche_currency") or agreement.get("currency")
-                for field in ("tranche_limit", "tranche_drawn_amount", "tranche_undrawn_amount", "face_value", "principal_outstanding", "carrying_amount"):
+                for field in ("tranche_limit", "tranche_drawn_amount", "tranche_undrawn_amount", "face_value", "principal_outstanding", "carrying_amount", "contractual_redemption_amount"):
                     value = row.pop(field, None)
                     row[f"{field}_m"] = value.get("value_m") if value else None
                     row[f"{field}_currency"] = value.get("currency") if value else None
@@ -1406,9 +1881,17 @@ def workbook(path: Path, records: list[dict], register: list[dict]) -> None:
         "CURRENCY_OR_BASIS_MISMATCH", "REPORTING_CURRENCY_EQUIVALENT_UNAVAILABLE",
         "REFERENCE_DATE_USED_AS_MATURITY", "MATURITY_RANGE_START_UNDISCLOSED",
         "SHARED_LIMIT_NON_ADDITIVE", "FACILITY_RECON_FAIL", "EXTRACTION_FAILED",
+        "BUCKET_INSTRUMENT_ALLOCATION_UNSUPPORTED", "DATE_ROLE_CONFLICT",
+        "EXACT_DATE_EVIDENCE_MISSING", "MATURED_STATUS_UNCONFIRMED",
+        "HOLDER_PUT_STATUS_UNKNOWN", "AMOUNT_SOURCE_CONFLICT",
+        "AGREEMENT_RECON_BLOCKED_BY_MIXED_EXPOSURE",
     }
     for record in records:
-        codes = record.get("validation_flags", []) or ([record["status"]] if record["status"] not in SUCCESS_STATUSES else [])
+        audits = ((record.get("extraction") or {}).get("normalization_audit") or [])
+        audit_codes = {audit.get("validation_code") for audit in audits}
+        codes = [code for code in record.get("validation_flags", []) if code not in audit_codes] or (
+            [record["status"]] if record["status"] not in SUCCESS_STATUSES and not audits else []
+        )
         for code in codes:
             severity = "HIGH" if code in blocking_codes or record["status"] not in SUCCESS_STATUSES else "MEDIUM"
             explanation = validation_explanation(code, record.get("error", ""))
@@ -1422,8 +1905,19 @@ def workbook(path: Path, records: list[dict], register: list[dict]) -> None:
             exceptions.append(row)
             review.append({
                 "ticker": record["ticker"], "company": record["target_name"], "severity": severity,
-                "validation_code": code, "affected_agreement_or_tranche": "", "explanation": explanation,
+                "validation_code": code, "reason": explanation,
                 "source_page": "", "summary_aggregation_blocked": code in blocking_codes,
+            })
+        for audit in audits:
+            review.append({
+                "ticker": record["ticker"], "company": record["target_name"],
+                "agreement_id": audit.get("agreement_id"), "tranche_name": audit.get("tranche_name"),
+                "severity": audit.get("severity"), "validation_code": audit.get("validation_code"),
+                "affected_normalized_field": audit.get("affected_field"),
+                "rejected_raw_value": audit.get("rejected_raw_value"),
+                "normalized_value": audit.get("normalized_value"), "reason": audit.get("reason"),
+                "source_page": audit.get("source_page"), "evidence": audit.get("evidence"),
+                "summary_aggregation_blocked": audit.get("summary_aggregation_blocked"),
             })
     review.sort(key=lambda row: ({"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(row["severity"], 3), row["ticker"]))
     run_logs = [record.get("run_log", {}) for record in records]
@@ -1589,6 +2083,7 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
         payload = None
         retained_payload = None
         retained_model = None
+        retained_raw_model: dict | None = None
         usage: dict = {}
         attempts: list[dict] = []
         error = ""
@@ -1614,16 +2109,24 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
                         attempt_usage.get("cached_input_tokens") or 0, attempt_usage.get("output_tokens") or 0,
                     )
                     attempts.append(attempt_usage)
-                    payload, usage = candidate, attempt_usage
+                    raw_model = candidate.model_dump(mode="json")
                     raw_text = "\n\n".join(page_texts)
-                    postprocess_agreements(payload, raw_text, allow_split=attempt == 2)
+                    payload = normalize_extraction(candidate, item, raw_text, args.as_of_date)
                     retained_payload, retained_model = payload.model_copy(deep=True), attempt_model
+                    retained_raw_model = raw_model
                     if payload.extraction_confidence < 0.60 and attempt < 2:
                         error = "Extraction confidence below 0.60; retrying"
                         continue
                     structural = agreement_structure_flags(payload, raw_text)
-                    if structural and attempt < 2:
-                        error = f"Agreement/tranche structure requires retry: {' | '.join(structural)}"
+                    normalization_retry = [
+                        code for code in payload.validation_flags if code in {
+                            "BUCKET_INSTRUMENT_ALLOCATION_UNSUPPORTED", "DATE_ROLE_CONFLICT",
+                            "EXACT_DATE_EVIDENCE_MISSING", "CURRENCY_OR_BASIS_MISMATCH",
+                            "MULTIPLE_TENORS_NOT_SPLIT", "MULTIPLE_TRANCHES_COLLAPSED",
+                        }
+                    ]
+                    if (structural or normalization_retry) and attempt < 2:
+                        error = "Normalization invariants require retry: " + " | ".join(dict.fromkeys(structural + normalization_retry))
                         continue
                     break
                 except Exception as exc:
@@ -1675,7 +2178,10 @@ def run_local(args: argparse.Namespace, extractor: Callable = extract_with_opena
                 for entry in attempts
             ), "checkpoint_status": "SAVED",
         }
-        record = build_record(item, payload, status, flags, grid, quality, run_log, error, args.as_of_date)
+        record = build_record(
+            item, payload, status, flags, grid, quality, run_log, error,
+            args.as_of_date, retained_raw_model,
+        )
         append_result(results_path, record)
         latest[item["ticker"]] = record
         checkpoint_workbook(output_path, current_schema_records(latest, register), register)

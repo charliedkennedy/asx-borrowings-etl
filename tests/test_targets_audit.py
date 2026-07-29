@@ -15,3 +15,16 @@ def test_targets_are_normalized_unique_and_preserve_known_aliases():
     assert "Acrow" in by_ticker["ACF"]["aliases"]
     for ticker in ("PEN", "RRC", "TSS", "VRN", "WON", "SCO"):
         assert ticker in by_ticker
+    required_names = {
+        "BSL": "BlueScope Steel Limited", "FPR": "FleetPartners Group Limited",
+        "HSN": "Hansen Technologies Ltd", "VEA": "Viva Energy Group Limited",
+        "BGA": "Bega Cheese Limited", "BRI": "Big River", "HLO": "Helloworld Travel Limited",
+        "IFL": "Insignia Financial", "C79": "Chrysos Corporation Limited",
+        "BRG": "Breville Group Limited", "LOV": "Lovisa Holdings Limited",
+        "SFC": "Schaffer Corporation Limited", "VVA": "Viva Leisure Group",
+        "PMV": "Premier Investments Limited", "FLT": "Flight Centre Travel Group Limited",
+        "ENN": "Elanor Investors Group", "AVD": "Avada", "COH": "Cochlear Limited",
+        "DOW": "Downer EDI Limited", "LIC": "Lifestyle Communities Limited",
+        "MMS": "McMillan Shakespeare Limited", "MYR": "Myer Holdings Limited",
+    }
+    assert all(by_ticker[ticker]["target_name"] == name for ticker, name in required_names.items())

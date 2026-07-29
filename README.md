@@ -74,7 +74,8 @@ The cost cap is an estimate from returned token usage, not a guarantee of the
 final invoice. The workbook is created before the first API request and
 atomically checkpointed after every issuer status.
 
-Schema version 4 separates the report balance date from the screening date. Use
+Schema version 5 separates the raw structured response from a deterministic
+normalized payload and separates the report balance date from the screening date. Use
 `--as-of-date YYYY-MM-DD` for a reproducible screen (otherwise the local run date
 is used) and `--request-timeout-seconds 240` to override the bounded request
 timeout. Results created under earlier schema versions are not resumed. The
@@ -90,3 +91,26 @@ filename-prefix format. The earlier downloader's reported 291-source-row input
 is not stored in this repository, so its 288-identifier count cannot be
 reconstructed beyond noting that it was a different source snapshot; no valid
 current target was removed to force the older count.
+
+## Post-merge controlled regression
+
+Start with local matching only; this requires no API key:
+
+```powershell
+python -m src.asx_maturity_screen --tickers IDX KMD ANN MVF BSL FPR VEA BGA VCX KPG IFL FLT APE ENN --match-only --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen_regression.xlsx" --as-of-date 2026-07-29
+```
+
+Inspect `outputs\document_register.csv`. The multi-name extraction gate requires
+every requested ticker to be `MATCHED_HIGH`; if a genuinely missing ticker is
+listed, rerun the same commands with that ticker removed from the `--tickers`
+arguments—do not edit Python files. After all remaining documents match, enter
+the key without echoing it and run the controlled extraction:
+
+```powershell
+$secureKey = Read-Host "OpenAI API key" -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', $secureKey).Password
+python -m src.asx_maturity_screen --tickers IDX KMD ANN MVF BSL FPR VEA BGA VCX KPG IFL FLT APE ENN --force --pdf-root "C:\Users\chakennedy\2025 FS" --targets targets.csv --output "outputs\asx_maturity_screen_regression.xlsx" --model gpt-5.6-luna --retry-model gpt-5.6-terra --max-api-cost-usd 5 --as-of-date 2026-07-29 --request-timeout-seconds 240
+Remove-Item Env:OPENAI_API_KEY
+```
+
+Review the regression workbook before considering any full-universe run.
